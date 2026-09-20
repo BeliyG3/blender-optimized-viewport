@@ -82,6 +82,24 @@ class RenderWork {
   /* Perform volume guiding buffer denoise. */
   bool volume_guiding_denoise = false;
 
+  struct {
+    /* Index of this independent one-sample input within the current frame. Negative when DLSS is
+     * not in use. */
+    int iteration = -1;
+    bool reset_history = false;
+    bool zero_motion = false;
+
+    /* Whether `PathTrace` owns the pixel jitter for this work and takes it from `iteration`.
+     *
+     * Only the offline pipeline does: it needs a reproducible Halton prefix per frame. The
+     * viewport must NOT, because `DLSSRenderController::plan_iteration()` restarts the sequence
+     * on every iteration 0, which would hand every played-back frame the same sub-pixel positions
+     * and produce aliasing that never resolves. There the jitter is owned by
+     * `Scene::update_camera_resolution()`, which advances a free-running Halton state once per
+     * render work. */
+    bool jitter_from_iteration = false;
+  } dlss;
+
   /* Conversion to bool, to simplify checks about whether there is anything to be done for this
    * work. */
   operator bool() const
@@ -107,6 +125,21 @@ class RenderScheduler {
   void set_denoiser_params(const DenoiseParams &params);
   bool is_denoiser_gpu_used() const;
 
+  /* How many path-traced samples go into one DLSS reconstruction. Everything that scales by it -
+   * the buffer's sample count, the colour scale on both sides of NGX, the display - has to read
+   * the same answer. */
+  static int get_dlss_samples_per_iteration();
+
+  /* Whether the render buffer is accumulating across iterations rather than being cleared before
+   * each one.
+   *
+   * The DLSS path clears every iteration so that the network always receives one sample, which
+   * means Cycles itself accumulates nothing and a still camera converges only as far as the
+   * network's own history reaches - a plateau rather than a limit. With accumulation enabled the
+   * buffer keeps summing while the camera stays put, and everything that scales by the sample
+   * count has to read the real total instead of one. */
+  bool is_accumulating_in_buffer() const;
+
   void set_adaptive_sampling(const AdaptiveSampling &adaptive_sampling);
   bool is_adaptive_sampling_used() const;
 
@@ -131,6 +164,14 @@ class RenderScheduler {
                          const bool use_sample_subset,
                          const int sample_subset_offset,
                          const int sample_subset_length);
+
+  /* Sample count to stop at while the user is interacting with the viewport, clamped by the
+   * regular sample limit. Zero disables the reduced budget.
+   *
+   * Only applies to the viewport DLSS path, where every sample is an independent temporal input:
+   * stopping early there trades convergence during motion for responsiveness, and accumulation
+   * continues from the same sample once interaction ends. */
+  void set_interactive_sample_budget(const int num_samples);
 
   /* Number of samples to render, starting from start sample.
    * The scheduler will schedule work in the range of
@@ -455,6 +496,10 @@ class RenderScheduler {
    * [sample_offset_, sample_offset_ + num_samples_ - 1] range, inclusively. */
   int sample_offset_ = 0;
   int num_samples_ = 0;
+
+  /* Reduced sample budget in effect while the user interacts. Deliberately not part of `state_`:
+   * `reset()` must not clear it, and it is re-pushed by the session once per iteration anyway. */
+  int interactive_num_samples_ = 0;
 
   /* Limit in seconds for how long path tracing is allowed to happen.
    * Zero means no limit is applied. */

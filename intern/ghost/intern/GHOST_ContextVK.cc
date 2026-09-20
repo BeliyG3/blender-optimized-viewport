@@ -7,6 +7,10 @@
  */
 
 #include "GHOST_ContextVK.hh"
+
+#ifdef WITH_DLSS_FRAME_GENERATION
+#  include "GHOST_NGXVK.hh"
+#endif
 #include "GHOST_Types.hh"
 #include <vulkan/vulkan_core.h>
 
@@ -920,8 +924,10 @@ GHOST_TSuccess GHOST_ContextVK::swapBufferAcquire()
   const bool use_hdr_swapchain = hdr_info_ &&
                                  (hdr_info_->wide_gamut_enabled || hdr_info_->hdr_enabled) &&
                                  device_vk.use_vk_ext_swapchain_colorspace;
-  if (use_hdr_swapchain != use_hdr_swapchain_) {
-    /* Re-create swapchain if HDR mode was toggled in the system settings. */
+  if (use_hdr_swapchain != use_hdr_swapchain_ || swapchain_recreate_requested_) {
+    /* Re-create swapchain if HDR mode was toggled in the system settings, or the present mode was
+     * changed through `setSwapInterval` - the same path, so neither needs a restart. */
+    swapchain_recreate_requested_ = false;
     recreateSwapchain(use_hdr_swapchain);
   }
   else {
@@ -1258,8 +1264,13 @@ static GHOST_TSuccess selectPresentMode(const GHOST_TVSyncModes vsync,
         }
       }
       CLOG_WARN(&LOG,
-                "Vulkan: VSync off was requested via --gpu-vsync, "
+                "Vulkan: VSync off was requested, "
                 "but VK_PRESENT_MODE_IMMEDIATE_KHR is not supported.");
+    }
+    /* FIFO is the one mode every implementation must offer, so strict never falls through. */
+    if (vsync == GHOST_kVSyncModeStrict) {
+      *r_presentMode = VK_PRESENT_MODE_FIFO_KHR;
+      return GHOST_kSuccess;
     }
   }
 
@@ -1480,6 +1491,28 @@ GHOST_TSuccess GHOST_ContextVK::recreateSwapchain(bool use_hdr_swapchain)
     image_count_requested = capabilities.maxImageCount;
   }
 
+  /* A change of present mode is not a resize: handing the driver the old swapchain as
+   * `oldSwapchain` while asking for a different mode came back on NVIDIA as
+   * VK_ERROR_OUT_OF_DEVICE_MEMORY for MAILBOX after IMMEDIATE - and a failed creation retires the
+   * old swapchain regardless, after which nothing could be presented at all. So for a mode change
+   * the old swapchain, and any that are still waiting to be discarded, are destroyed first, and
+   * the new one is created from nothing. Measured: off, strict and on each recreate cleanly, in
+   * any order, without a restart. */
+  if (swapchain_ != VK_NULL_HANDLE && present_mode != present_mode_) {
+    device_vk.wait_idle();
+    for (GHOST_Frame &frame : frame_data_) {
+      for (VkSwapchainKHR swapchain : frame.discard_pile.swapchains) {
+        this->destroySwapchainPresentFences(swapchain);
+        vkDestroySwapchainKHR(device_vk.vk_device, swapchain, nullptr);
+      }
+      frame.discard_pile.swapchains.clear();
+    }
+    this->destroySwapchainPresentFences(swapchain_);
+    vkDestroySwapchainKHR(device_vk.vk_device, swapchain_, nullptr);
+    swapchain_ = VK_NULL_HANDLE;
+  }
+  present_mode_ = present_mode;
+
   VkSwapchainKHR old_swapchain = swapchain_;
 
   /* First time we stretch the swapchain image as it can happen that the first frame size isn't
@@ -1523,8 +1556,21 @@ GHOST_TSuccess GHOST_ContextVK::recreateSwapchain(bool use_hdr_swapchain)
   create_info.queueFamilyIndexCount = 0;
   create_info.pQueueFamilyIndices = nullptr;
 
-  VK_CHECK(vkCreateSwapchainKHR(device_vk.vk_device, &create_info, nullptr, &swapchain_),
-           GHOST_kFailure);
+  const VkResult create_result = vkCreateSwapchainKHR(
+      device_vk.vk_device, &create_info, nullptr, &swapchain_);
+  if (create_result != VK_SUCCESS) {
+    CLOG_ERROR(&LOG,
+               "Vulkan: vkCreateSwapchainKHR resulted in code %s.",
+               blender::gpu::to_string(create_result));
+    /* The old swapchain is retired by the call whether or not it succeeded, so it cannot be kept
+     * as the swapchain in use: the next acquire would fail on it forever. Let it go, and the next
+     * acquire creates a swapchain from nothing. */
+    if (old_swapchain != VK_NULL_HANDLE) {
+      discard_pile.swapchains.push_back(old_swapchain);
+    }
+    swapchain_ = VK_NULL_HANDLE;
+    return GHOST_kFailure;
+  }
 
   /* image_count may not be what we requested! Getter for final value. */
   uint32_t actual_image_count = 0;
@@ -1666,12 +1712,31 @@ GHOST_TSuccess GHOST_ContextVK::initializeDrawingContext()
 
   blender::Vector<const char *> required_device_extensions;
   blender::Vector<const char *> optional_device_extensions;
+#ifdef WITH_DLSS_FRAME_GENERATION
+  blender::Vector<std::string> ngx_instance_extensions;
+  blender::Vector<std::string> ngx_device_extensions;
+#endif
 
   /* Initialize VkInstance */
   if (!vulkan_instance.has_value()) {
     vulkan_instance.emplace();
     GHOST_InstanceVK &instance_vk = vulkan_instance.value();
     instance_vk.extensions.enable(VK_EXT_DEBUG_UTILS_EXTENSION_NAME, true);
+
+#ifdef WITH_DLSS_FRAME_GENERATION
+    {
+      std::string ngx_error;
+      if (blender::ghost::ngx_vk_instance_extensions_get(ngx_instance_extensions, ngx_error)) {
+        for (const std::string &extension : ngx_instance_extensions) {
+          instance_vk.extensions.enable(extension.c_str(), true);
+        }
+      }
+      else {
+        CLOG_WARN(
+            &LOG, "DLSS Frame Generation instance extensions unavailable: %s", ngx_error.c_str());
+      }
+    }
+#endif
 
     /* Some XR platforms load functions without knowing if they were replaced by a core
      * function. Monado for example always uses the extension functions. Due to maintenance changes
@@ -1858,6 +1923,25 @@ GHOST_TSuccess GHOST_ContextVK::initializeDrawingContext()
     if (!instance_vk.select_physical_device(preferred_device_, required_device_extensions)) {
       return GHOST_kFailure;
     }
+
+#ifdef WITH_DLSS_FRAME_GENERATION
+    {
+      std::string ngx_error;
+      if (blender::ghost::ngx_vk_device_extensions_get(instance_vk.vk_instance,
+                                                       instance_vk.vk_physical_device,
+                                                       ngx_device_extensions,
+                                                       ngx_error))
+      {
+        for (const std::string &extension : ngx_device_extensions) {
+          optional_device_extensions.append(extension.c_str());
+        }
+      }
+      else {
+        CLOG_WARN(
+            &LOG, "DLSS Frame Generation device extensions unavailable: %s", ngx_error.c_str());
+      }
+    }
+#endif
 
     if (!instance_vk.create_device(use_vk_ext_swapchain_colorspace,
                                    context_params_.is_debug,

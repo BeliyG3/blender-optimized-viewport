@@ -9,6 +9,7 @@
  */
 
 #include <cstring>
+#include <memory>
 
 #include "BLI_math_vector.h"
 #include "BLI_math_vector_types.hh"
@@ -22,6 +23,7 @@
 #include "DNA_vec_types.h"
 
 #include "GPU_capabilities.hh"
+#include "GPU_dlss_ray_reconstruction.hh"
 #include "GPU_framebuffer.hh"
 #include "GPU_immediate.hh"
 #include "GPU_matrix.hh"
@@ -44,6 +46,44 @@ struct GPUViewportBatch {
     rctf rect_pos = {};
     rctf rect_uv = {};
   } last_used_parameters;
+};
+
+struct GPUViewportFrameGenerationState {
+  bool active_this_frame = false;
+  bool hold_last_real_this_frame = false;
+  bool was_active = false;
+  int inactive_draws = 0;
+  bool permanently_failed = false;
+  bool pending_valid = false;
+
+  GPUViewportFrameGenerationInput pending;
+  gpu::FrameGenerationPresentationQueue presentation;
+  std::unique_ptr<gpu::FrameGenerationSession> session;
+
+  gpu::Texture *display_color_tx = nullptr;
+  gpu::FrameBuffer *display_color_fb = nullptr;
+
+  void reset_history()
+  {
+    pending_valid = false;
+    presentation.reset();
+    if (session != nullptr) {
+      session->reset();
+    }
+  }
+
+  void resources_free()
+  {
+    session.reset();
+    GPU_FRAMEBUFFER_FREE_SAFE(display_color_fb);
+    GPU_TEXTURE_FREE_SAFE(display_color_tx);
+    active_this_frame = false;
+    hold_last_real_this_frame = false;
+    was_active = false;
+    inactive_draws = 0;
+    permanently_failed = false;
+    reset_history();
+  }
 };
 
 static struct {
@@ -87,6 +127,7 @@ struct GPUViewport {
    * moment. The end goal would be to let the GPUViewport do the color management. */
   bool do_color_management = false;
   GPUViewportBatch batch;
+  GPUViewportFrameGenerationState frame_generation;
 };
 
 enum {
@@ -104,6 +145,43 @@ bool GPU_viewport_do_update(GPUViewport *viewport)
   bool ret = (viewport->flag & DO_UPDATE);
   viewport->flag &= ~DO_UPDATE;
   return ret;
+}
+
+void GPU_viewport_frame_generation_mark_active(GPUViewport *viewport)
+{
+  GPUViewportFrameGenerationState &state = viewport->frame_generation;
+  if (!state.active_this_frame && !state.was_active) {
+    state.reset_history();
+  }
+  state.active_this_frame = true;
+  state.hold_last_real_this_frame = false;
+}
+
+void GPU_viewport_frame_generation_hold_last_real(GPUViewport *viewport)
+{
+  GPU_viewport_frame_generation_mark_active(viewport);
+  viewport->frame_generation.hold_last_real_this_frame = true;
+}
+
+GPUViewportFrameGenerationSubmitResult GPU_viewport_frame_generation_submit(
+    GPUViewport *viewport, const GPUViewportFrameGenerationInput &input)
+{
+  GPUViewportFrameGenerationState &state = viewport->frame_generation;
+  if (state.permanently_failed) {
+    return GPUViewportFrameGenerationSubmitResult::FAILED;
+  }
+  if (!state.active_this_frame || input.depth == nullptr || input.motion == nullptr ||
+      input.full_size != viewport->size || input.region_size.x <= 0 || input.region_size.y <= 0 ||
+      input.render_size.x <= 0 || input.render_size.y <= 0 || input.full_offset.x < 0 ||
+      input.full_offset.y < 0 || input.full_offset.x + input.region_size.x > input.full_size.x ||
+      input.full_offset.y + input.region_size.y > input.full_size.y)
+  {
+    return GPUViewportFrameGenerationSubmitResult::RETRY;
+  }
+
+  state.pending = input;
+  state.pending_valid = true;
+  return GPUViewportFrameGenerationSubmitResult::ACCEPTED;
 }
 
 GPUViewport *GPU_viewport_create()
@@ -190,6 +268,7 @@ static void gpu_viewport_textures_create(GPUViewport *viewport)
 
 static void gpu_viewport_textures_free(GPUViewport *viewport)
 {
+  viewport->frame_generation.resources_free();
   GPU_FRAMEBUFFER_FREE_SAFE(viewport->stereo_comp_fb);
   GPU_FRAMEBUFFER_FREE_SAFE(viewport->render_fb);
   GPU_FRAMEBUFFER_FREE_SAFE(viewport->overlay_fb);
@@ -202,8 +281,34 @@ static void gpu_viewport_textures_free(GPUViewport *viewport)
   GPU_TEXTURE_FREE_SAFE(viewport->depth_tx);
 }
 
+/* Ask NGX once whether a Ray Reconstruction model runs on this path.
+ *
+ * `BLENDER_DLSS_RR_PROBE` names the model, by the SDK's numbering. This is a question, not a
+ * feature: it exists because the same model refuses to run on the CUDA path Cycles uses, and the
+ * answer decides whether the denoiser is worth moving here. Called from the viewport because that
+ * is the earliest place with a context that is certainly alive.
+ */
+static void gpu_viewport_dlss_rr_probe()
+{
+  static bool probed = false;
+  if (probed) {
+    return;
+  }
+  probed = true;
+
+  const char *preset = getenv("BLENDER_DLSS_RR_PROBE");
+  if (preset == nullptr) {
+    return;
+  }
+
+  printf("%s\n", blender::gpu::dlss_ray_reconstruction_probe(atoi(preset)).c_str());
+  fflush(stdout);
+}
+
 void GPU_viewport_bind(GPUViewport *viewport, int view, const rcti *rect)
 {
+  gpu_viewport_dlss_rr_probe();
+
   int2 rect_size;
   /* add one pixel because of scissor test */
   rect_size[0] = BLI_rcti_size_x(rect) + 1;
@@ -218,6 +323,8 @@ void GPU_viewport_bind(GPUViewport *viewport, int view, const rcti *rect)
   }
 
   viewport->active_view = view;
+  viewport->frame_generation.active_this_frame = false;
+  viewport->frame_generation.hold_last_real_this_frame = false;
 }
 
 void GPU_viewport_bind_from_offscreen(GPUViewport *viewport, GPUOffScreen *ofs, bool is_xr_surface)
@@ -241,6 +348,9 @@ void GPU_viewport_bind_from_offscreen(GPUViewport *viewport, GPUOffScreen *ofs, 
   viewport->depth_tx = depth;
 
   gpu_viewport_textures_create(viewport);
+  viewport->frame_generation.active_this_frame = false;
+  viewport->frame_generation.hold_last_real_this_frame = false;
+  viewport->frame_generation.reset_history();
 }
 
 void GPU_viewport_colorspace_set(GPUViewport *viewport,
@@ -434,16 +544,15 @@ static void gpu_viewport_batch_free(GPUViewport *viewport)
 
 /** \} */
 
-static void gpu_viewport_draw_colormanaged(GPUViewport *viewport,
-                                           int view,
-                                           const rctf *rect_pos,
-                                           const rctf *rect_uv,
-                                           bool display_colorspace,
-                                           bool do_overlay_merge)
+static void gpu_viewport_draw_texture(GPUViewport *viewport,
+                                      gpu::Texture *color,
+                                      gpu::Texture *color_overlay,
+                                      const rctf *rect_pos,
+                                      const rctf *rect_uv,
+                                      const bool display_colorspace,
+                                      const bool do_overlay_merge,
+                                      const float dither)
 {
-  gpu::Texture *color = viewport->color_render_tx[view];
-  gpu::Texture *color_overlay = viewport->color_overlay_tx[view];
-
   bool use_ocio = false;
 
   if (viewport->do_color_management && display_colorspace) {
@@ -458,7 +567,7 @@ static void gpu_viewport_draw_colormanaged(GPUViewport *viewport,
     use_ocio = IMB_colormanagement_setup_glsl_draw_from_space(&viewport->view_settings,
                                                               &viewport->display_settings,
                                                               nullptr,
-                                                              viewport->dither,
+                                                              dither,
                                                               false,
                                                               do_overlay_merge);
   }
@@ -483,6 +592,236 @@ static void gpu_viewport_draw_colormanaged(GPUViewport *viewport,
   if (use_ocio) {
     IMB_colormanagement_finish_glsl_draw();
   }
+}
+
+static void gpu_viewport_draw_colormanaged(GPUViewport *viewport,
+                                           const int view,
+                                           const rctf *rect_pos,
+                                           const rctf *rect_uv,
+                                           const bool display_colorspace,
+                                           const bool do_overlay_merge)
+{
+  gpu_viewport_draw_texture(viewport,
+                            viewport->color_render_tx[view],
+                            viewport->color_overlay_tx[view],
+                            rect_pos,
+                            rect_uv,
+                            display_colorspace,
+                            do_overlay_merge,
+                            viewport->dither);
+}
+
+static bool gpu_viewport_frame_generation_resources_ensure(GPUViewport *viewport)
+{
+  GPUViewportFrameGenerationState &state = viewport->frame_generation;
+  if (state.display_color_tx != nullptr &&
+      GPU_texture_width(state.display_color_tx) == viewport->size.x &&
+      GPU_texture_height(state.display_color_tx) == viewport->size.y)
+  {
+    return true;
+  }
+
+  GPU_FRAMEBUFFER_FREE_SAFE(state.display_color_fb);
+  GPU_TEXTURE_FREE_SAFE(state.display_color_tx);
+
+  const eGPUTextureUsage usage = GPU_TEXTURE_USAGE_SHADER_READ | GPU_TEXTURE_USAGE_SHADER_WRITE |
+                                 GPU_TEXTURE_USAGE_ATTACHMENT;
+  state.display_color_tx = GPU_texture_create_2d("DLSSG display color",
+                                                 viewport->size.x,
+                                                 viewport->size.y,
+                                                 1,
+                                                 gpu::TextureFormat::SFLOAT_16_16_16_16,
+                                                 usage,
+                                                 nullptr);
+  if (state.display_color_tx == nullptr) {
+    return false;
+  }
+
+  GPU_framebuffer_ensure_config(&state.display_color_fb,
+                                {
+                                    GPU_ATTACHMENT_NONE,
+                                    GPU_ATTACHMENT_TEXTURE(state.display_color_tx),
+                                });
+  return state.display_color_fb != nullptr;
+}
+
+static bool gpu_viewport_frame_generation_prepare_color(GPUViewport *viewport, const int view)
+{
+  GPUViewportFrameGenerationState &state = viewport->frame_generation;
+  if (!gpu_viewport_frame_generation_resources_ensure(viewport)) {
+    return false;
+  }
+
+  gpu::FrameBuffer *destination = GPU_framebuffer_active_get();
+  GPU_framebuffer_bind(state.display_color_fb);
+  GPU_framebuffer_clear_color(state.display_color_fb, {0.0, 0.0, 0.0, 1.0});
+  GPU_color_mask(true, true, true, false);
+  GPU_matrix_push();
+  GPU_matrix_push_projection();
+  GPU_matrix_identity_set();
+  GPU_matrix_identity_projection_set();
+
+  rctf position = {-1.0f, 1.0f, -1.0f, 1.0f};
+  rctf uv = {0.0f, 1.0f, 0.0f, 1.0f};
+  gpu_viewport_draw_texture(viewport,
+                            viewport->color_render_tx[view],
+                            viewport->color_overlay_tx[view],
+                            &position,
+                            &uv,
+                            true,
+                            false,
+                            0.0f);
+  GPU_matrix_pop_projection();
+  GPU_matrix_pop();
+  GPU_color_mask(true, true, true, true);
+
+  if (destination != nullptr) {
+    GPU_framebuffer_bind(destination);
+  }
+  else {
+    GPU_framebuffer_restore();
+  }
+
+  return true;
+}
+
+static bool gpu_viewport_frame_generation_evaluate(GPUViewport *viewport)
+{
+  GPUViewportFrameGenerationState &state = viewport->frame_generation;
+  if (!state.pending_valid || state.permanently_failed || state.display_color_tx == nullptr) {
+    return false;
+  }
+
+  if (state.session == nullptr) {
+    state.session = gpu::frame_generation_session_create();
+  }
+  if (state.session == nullptr) {
+    state.permanently_failed = true;
+    state.pending_valid = false;
+    return false;
+  }
+
+  const GPUViewportFrameGenerationInput input = state.pending;
+  state.pending_valid = false;
+
+  gpu::FrameGenerationEvaluation evaluation;
+  evaluation.color = state.display_color_tx;
+  evaluation.depth = input.depth;
+  evaluation.motion = input.motion;
+  evaluation.color_width = viewport->size.x;
+  evaluation.color_height = viewport->size.y;
+  evaluation.color_subrect_x = 0;
+  evaluation.color_subrect_y = 0;
+  evaluation.color_subrect_width = viewport->size.x;
+  evaluation.color_subrect_height = viewport->size.y;
+  evaluation.render_width = input.render_size.x;
+  evaluation.render_height = input.render_size.y;
+  evaluation.frame_id = input.frame_id;
+  evaluation.reset = input.reset;
+  evaluation.color_buffers_hdr = false;
+  evaluation.camera = input.camera;
+
+  const bool success = state.session->evaluate(evaluation);
+
+  if (!success) {
+    state.permanently_failed = true;
+    state.presentation.reset();
+    return false;
+  }
+
+  state.presentation.evaluation_succeeded(input.present_generated);
+  return true;
+}
+
+static bool gpu_viewport_draw_frame_generated(GPUViewport *viewport,
+                                              const int view,
+                                              const rctf *rect_pos,
+                                              const rctf *rect_uv,
+                                              const bool display_colorspace,
+                                              const bool do_overlay_merge)
+{
+  GPUViewportFrameGenerationState &state = viewport->frame_generation;
+  if (!display_colorspace || viewport->use_hdr_display) {
+    if (state.was_active) {
+      state.reset_history();
+    }
+    state.permanently_failed = false;
+    state.was_active = false;
+    state.inactive_draws = 0;
+    return false;
+  }
+
+  if (state.permanently_failed) {
+    if (!state.active_this_frame) {
+      state.permanently_failed = false;
+      state.reset_history();
+    }
+    state.was_active = state.active_this_frame;
+    return false;
+  }
+
+  if (!state.active_this_frame) {
+    gpu::Texture *retained_real = state.session != nullptr ? state.session->real_texture_get() :
+                                                             nullptr;
+    if (state.was_active && state.inactive_draws == 0 && retained_real != nullptr) {
+      state.inactive_draws++;
+      gpu_viewport_draw_texture(viewport,
+                                retained_real,
+                                viewport->color_overlay_tx[view],
+                                rect_pos,
+                                rect_uv,
+                                false,
+                                do_overlay_merge,
+                                0.0f);
+      return true;
+    }
+    if (state.was_active) {
+      state.reset_history();
+    }
+    state.was_active = false;
+    state.inactive_draws = 0;
+    return false;
+  }
+
+  state.was_active = true;
+  state.inactive_draws = 0;
+  bool evaluated = false;
+  if (!state.hold_last_real_this_frame) {
+    if (!gpu_viewport_frame_generation_prepare_color(viewport, view)) {
+      state.permanently_failed = true;
+      return false;
+    }
+    evaluated = gpu_viewport_frame_generation_evaluate(viewport);
+  }
+  const gpu::FrameGenerationPresentation presentation = state.presentation.consume(
+      state.hold_last_real_this_frame);
+
+  gpu::Texture *present_texture = nullptr;
+  if (presentation == gpu::FrameGenerationPresentation::GENERATED && state.session != nullptr) {
+    present_texture = state.session->generated_texture_get();
+  }
+  else if ((presentation == gpu::FrameGenerationPresentation::PAIRED_REAL ||
+            presentation == gpu::FrameGenerationPresentation::RETAINED_REAL || evaluated) &&
+           state.session != nullptr)
+  {
+    present_texture = state.session->real_texture_get();
+  }
+  else {
+    present_texture = state.display_color_tx;
+  }
+  if (present_texture == nullptr) {
+    return false;
+  }
+
+  gpu_viewport_draw_texture(viewport,
+                            present_texture,
+                            viewport->color_overlay_tx[view],
+                            rect_pos,
+                            rect_uv,
+                            false,
+                            do_overlay_merge,
+                            0.0f);
+  return true;
 }
 
 void GPU_viewport_draw_to_screen_ex(GPUViewport *viewport,
@@ -532,8 +871,12 @@ void GPU_viewport_draw_to_screen_ex(GPUViewport *viewport,
     std::swap(uv_rect.ymin, uv_rect.ymax);
   }
 
-  gpu_viewport_draw_colormanaged(
-      viewport, view, &pos_rect, &uv_rect, display_colorspace, do_overlay_merge);
+  if (!gpu_viewport_draw_frame_generated(
+          viewport, view, &pos_rect, &uv_rect, display_colorspace, do_overlay_merge))
+  {
+    gpu_viewport_draw_colormanaged(
+        viewport, view, &pos_rect, &uv_rect, display_colorspace, do_overlay_merge);
+  }
 }
 
 void GPU_viewport_draw_to_screen(GPUViewport *viewport, int view, const rcti *rect)
@@ -569,6 +912,8 @@ void GPU_viewport_unbind_from_offscreen(GPUViewport *viewport,
 
   gpu_viewport_draw_colormanaged(
       viewport, view, &pos_rect, &uv_rect, display_colorspace, do_overlay_merge);
+  viewport->frame_generation.reset_history();
+  viewport->frame_generation.was_active = false;
 
   /* This one is from the offscreen. Don't free it with the viewport. */
   viewport->depth_tx = nullptr;

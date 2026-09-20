@@ -352,6 +352,23 @@ class Device {
 
   virtual void mem_alloc(device_memory &mem) = 0;
   virtual void mem_copy_to(device_memory &mem) = 0;
+
+  /* Upload a byte range of an allocation that is already resident, leaving the rest untouched.
+   *
+   * Scene-wide arrays - the triangle indices, the shader indices, the attribute table - hold every
+   * geometry in the scene end to end. Changing one geometry marks the whole array modified, so the
+   * full array is re-uploaded: on a 742-mesh scene where four meshes had actually changed that
+   * measured 180 ms for the meshes and 260 ms for the attributes, per frame. A range upload turns
+   * that into the size of what changed.
+   *
+   * The default falls back to a full upload, so a back-end that does not implement it stays
+   * correct. */
+  virtual void mem_copy_to_range(device_memory &mem,
+                                 const size_t /*offset_bytes*/,
+                                 const size_t /*size_bytes*/)
+  {
+    mem_copy_to(mem);
+  }
   virtual void mem_move_to_host(device_memory &mem) = 0;
   virtual void mem_copy_from(
       device_memory &mem, const size_t y, size_t w, const size_t h, size_t elem) = 0;
@@ -424,6 +441,9 @@ class GPUDevice : public Device {
   virtual GPUDevice::Mem *generic_alloc(device_memory &mem, const size_t pitch_padding = 0);
   virtual void generic_free(device_memory &mem);
   virtual void generic_copy_to(device_memory &mem);
+  virtual void generic_copy_to_range(device_memory &mem,
+                                     const size_t offset_bytes,
+                                     const size_t size_bytes);
 
   /* total - amount of device memory, free - amount of available device memory */
   virtual void get_device_memory_info(size_t &total, size_t &free) = 0;

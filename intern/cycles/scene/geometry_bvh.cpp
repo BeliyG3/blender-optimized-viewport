@@ -112,6 +112,10 @@ void GeometryManager::device_update_bvh(Device *device,
   bparams.num_motion_point_steps = scene->params.num_bvh_time_steps;
   bparams.bvh_type = scene->params.bvh_type;
   bparams.curve_subdivisions = scene->params.curve_subdivisions();
+  /* Same predicate the OptiX device uses for `usesMotionBlur`: object motion arrays are also
+   * populated for the interactive motion pass, and instancing them then would trace geometry
+   * somewhere between the previous and the current transform. */
+  bparams.use_object_motion = (dscene->data.kernel_features & KERNEL_FEATURE_OBJECT_MOTION) != 0;
 
   LOG_INFO << "Using " << bvh_layout_name(bparams.bvh_layout) << " layout.";
 
@@ -123,6 +127,11 @@ void GeometryManager::device_update_bvh(Device *device,
   if (bvh == nullptr) {
     scene->bvh = BVH::create(bparams, scene->geometry, scene->objects, device);
     bvh = scene->bvh.get();
+  }
+  else {
+    /* An existing BVH keeps the parameters it was created with, and toggling motion blur does not
+     * recreate it, so refresh the flag the instance build reads. */
+    bvh->params.use_object_motion = bparams.use_object_motion;
   }
 
   device->build_bvh(bvh, progress, can_refit);

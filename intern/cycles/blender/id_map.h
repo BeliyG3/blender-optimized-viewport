@@ -7,6 +7,9 @@
 #include <cstring>
 
 #include "scene/geometry.h"
+/* The sweep reads `used_stamp` off the node, so every type this map is instantiated with has to be
+ * complete here - a forward declaration was enough only while liveness lived in a separate set. */
+#include "scene/procedural.h"
 #include "scene/scene.h"
 
 #include "util/map.h"
@@ -41,12 +44,11 @@ template<typename K, typename T, typename Flags = uint> class id_map {
 
   T *find(const K &key)
   {
-    if (b_map.find(key) != b_map.end()) {
-      T *data = b_map[key];
-      return data;
-    }
-
-    return nullptr;
+    /* One search, not two. `b_map` is a tree, and this map holds an entry per instance - 33858 of
+     * them on a scene driven by Geometry Nodes - so the second lookup walked another fifteen
+     * comparisons for a value the first one had already reached. */
+    const auto it = b_map.find(key);
+    return (it != b_map.end()) ? it->second : nullptr;
   }
 
   void set_recalc(void *id_ptr)
@@ -66,7 +68,37 @@ template<typename K, typename T, typename Flags = uint> class id_map {
 
   void pre_sync()
   {
-    used_set.clear();
+    /* A new epoch invalidates every stamp at once, so nothing has to be cleared. The counter is
+     * what `post_sync` compares against; `used_this_sync` is how it learns, without walking
+     * anything, whether every entry was seen. */
+    used_epoch++;
+    used_this_sync = 0;
+
+    if (used_epoch == 0) {
+      /* Wrapped. Only reachable after four billion syncs, but a stamp left over from epoch 0 would
+       * read as current, so they are cleared once and the epoch restarts past the initial value. */
+      for (const auto &entry : b_map) {
+        entry.second->used_stamp = 0;
+      }
+      used_epoch = 1;
+    }
+  }
+
+  /* Nodes this sync created and destroyed. Not answerable from the `recalc` that `add_or_update`
+   * returns: that is true both for a node that was just created and for one that merely needs
+   * recomputing, so it cannot tell "recreated" from "changed".
+   *
+   * Worth counting because the cost is out of all proportion to the number. A single created
+   * object makes the object manager reallocate every scene array and drops the attribute layout
+   * reuse - that is, one recreated object costs exactly what the layout snapshot exists to avoid,
+   * no matter that the scene has 33858 of them and only one moved. */
+  int stats_created = 0;
+  int stats_deleted = 0;
+
+  void clear_stats()
+  {
+    stats_created = 0;
+    stats_deleted = 0;
   }
 
   /* Add new data. */
@@ -111,6 +143,7 @@ template<typename K, typename T, typename Flags = uint> class id_map {
       data = scene->create_node<T>();
       add(key, data);
       recalc = true;
+      stats_created++;
     }
     else {
       /* check if updated needed. */
@@ -126,13 +159,16 @@ template<typename K, typename T, typename Flags = uint> class id_map {
   bool is_used(const K &key)
   {
     T *data = find(key);
-    return (data) ? used_set.find(data) != used_set.end() : false;
+    return (data) ? data->used_stamp == used_epoch : false;
   }
 
   void used(T *data)
   {
     /* tag data as still in use */
-    used_set.insert(data);
+    if (data->used_stamp != used_epoch) {
+      data->used_stamp = used_epoch;
+      used_this_sync++;
+    }
   }
 
   void set_default(T *data)
@@ -142,30 +178,37 @@ template<typename K, typename T, typename Flags = uint> class id_map {
 
   void post_sync(bool do_delete = true)
   {
-    map<K, T *> new_map;
-    set<T *> nodes_to_delete;
-    using TMapPair = pair<const K, T *>;
-    typename map<K, T *>::iterator jt;
+    /* Nothing died, so there is nothing to sweep. `used_this_sync` counts entries marked for the
+     * first time this epoch, and every mark goes through a node already in the map, so equality
+     * with the map's size means every entry was seen. On a scene of 33858 instances this turns the
+     * sweep - a walk of the whole tree - into a comparison, and playback never loses an entry.
+     *
+     * Compared with `!=` rather than `<` so that anything unexpected still falls through to the
+     * full walk instead of silently skipping it. */
+    if (do_delete && used_this_sync != b_map.size()) {
+      /* Erases in place. Rebuilding the map meant inserting every surviving entry into a fresh tree
+       * and then assigning it over the old one - two allocations and a full re-sort per frame, for
+       * a map that usually loses nothing at all. */
+      set<T *> nodes_to_delete;
 
-    for (jt = b_map.begin(); jt != b_map.end(); jt++) {
-      TMapPair &pair = *jt;
-
-      if (do_delete && used_set.find(pair.second) == used_set.end()) {
-        flags.erase(pair.second);
-        nodes_to_delete.insert(pair.second);
+      for (auto it = b_map.begin(); it != b_map.end();) {
+        if (it->second->used_stamp != used_epoch) {
+          flags.erase(it->second);
+          nodes_to_delete.insert(it->second);
+          it = b_map.erase(it);
+          stats_deleted++;
+        }
+        else {
+          ++it;
+        }
       }
-      else {
-        new_map[pair.first] = pair.second;
+
+      if (!nodes_to_delete.empty()) {
+        scene->delete_nodes(nodes_to_delete);
       }
     }
 
-    if (!nodes_to_delete.empty()) {
-      scene->delete_nodes(nodes_to_delete);
-    }
-
-    used_set.clear();
     b_recalc.clear();
-    b_map = new_map;
   }
 
   const map<K, T *> &key_to_scene_data()
@@ -198,7 +241,13 @@ template<typename K, typename T, typename Flags = uint> class id_map {
 
  protected:
   map<K, T *> b_map;
-  set<T *> used_set;
+  /* Liveness, as an epoch rather than a container. This used to be a hash set of node pointers
+   * rebuilt every sync: on a scene where Geometry Nodes turn 837 objects into 33858 instances that
+   * is 33858 node allocations per frame, as many frees on the next, and a hash miss per entry when
+   * the map is swept - 1.9 ms on a 13900K, and 2.5 ms of the measured tail on a 10600K. A stamp on
+   * the node answers the same question by comparison and needs no memory at all. */
+  uint32_t used_epoch = 0;
+  size_t used_this_sync = 0;
   map<T *, uint> flags;
   set<const void *> b_recalc;
   Scene *scene;

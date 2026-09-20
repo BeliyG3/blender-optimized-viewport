@@ -265,7 +265,12 @@ void BVHEmbree::add_instance(Object *ob, const int i)
   BVHEmbree *instance_bvh = static_cast<BVHEmbree *>(ob->get_geometry()->bvh.get());
   assert(instance_bvh != nullptr);
 
-  const size_t num_object_motion_steps = ob->use_motion() ? ob->get_motion().size() : 1;
+  /* The motion array is also filled for the interactive motion pass, which only feeds the
+   * denoiser. Instancing it when the kernel does not trace object motion would place the geometry
+   * between the previous and the current transform, since rays then carry a fixed time. */
+  const bool use_object_motion = params.use_object_motion && ob->use_motion();
+
+  const size_t num_object_motion_steps = use_object_motion ? ob->get_motion().size() : 1;
   const size_t num_motion_steps = min(num_object_motion_steps, (size_t)RTC_MAX_TIME_STEP_COUNT);
   assert(num_object_motion_steps <= RTC_MAX_TIME_STEP_COUNT);
 
@@ -273,7 +278,7 @@ void BVHEmbree::add_instance(Object *ob, const int i)
   rtcSetGeometryInstancedScene(geom_id, instance_bvh->scene);
   rtcSetGeometryTimeStepCount(geom_id, num_motion_steps);
 
-  if (ob->use_motion()) {
+  if (use_object_motion) {
     array<DecomposedTransform> decomp(ob->get_motion().size());
     transform_motion_decompose(decomp.data(), ob->get_motion().data(), ob->get_motion().size());
     for (size_t step = 0; step < num_motion_steps; ++step) {

@@ -4,6 +4,8 @@
 
 #include "scene/object.h"
 
+#include <atomic>
+
 #include "device/device.h"
 #include "kernel/types.h"
 #include "scene/camera.h"
@@ -225,6 +227,23 @@ void Object::tag_update(Scene *scene)
   if (is_modified()) {
     flag |= ObjectManager::OBJECT_MODIFIED;
 
+    /* The per-object primitive offsets come from the object's geometry, so swapping that geometry
+     * moves them - while merely moving the object does not. OBJECT_MODIFIED covers both, so the
+     * narrower question is asked here. */
+    if (geometry_is_modified()) {
+      scene->object_manager->tag_prim_offsets_modified();
+
+      /* Swapping geometry can take an emitter out of the tree as easily as put one in, and the
+       * emission check further down only ever sees the geometry the object carries now. */
+      scene->light_manager->tag_update(scene, LightManager::EMISSIVE_MESH_MODIFIED);
+    }
+
+    /* Light linking. The tree sorts and groups its emitters by membership, and reads
+     * `receiver_light_set` off every object in the scene, emitter or not. */
+    if (light_set_membership_is_modified() || receiver_light_set_is_modified()) {
+      scene->light_manager->tag_update(scene, LightManager::LIGHT_MODIFIED);
+    }
+
     if (use_holdout_is_modified()) {
       flag |= ObjectManager::HOLDOUT_MODIFIED;
     }
@@ -241,17 +260,22 @@ void Object::tag_update(Scene *scene)
       if (geometry->has_volume) {
         scene->volume_manager->tag_update({this}, flag);
       }
+
+      /* A real light carries its position through the object transform, and the emission check
+       * below is about shaders on geometry - it is not the right question for a light. Asked
+       * separately so that moving a lamp still rebuilds the tree once the manager stops being
+       * woken by every object that moves. */
+      if (geometry->is_light()) {
+        scene->light_manager->tag_update(scene, LightManager::LIGHT_MODIFIED);
+      }
     }
 
     if (visibility_is_modified()) {
       flag |= ObjectManager::VISIBILITY_MODIFIED;
     }
 
-    for (Node *node : geometry->get_used_shaders()) {
-      Shader *shader = static_cast<Shader *>(node);
-      if (shader->emission_sampling != EMISSION_SAMPLING_NONE) {
-        scene->light_manager->tag_update(scene, LightManager::EMISSIVE_MESH_MODIFIED);
-      }
+    if (geometry->has_emission_shader()) {
+      scene->light_manager->tag_update(scene, LightManager::EMISSIVE_MESH_MODIFIED);
     }
   }
 
@@ -506,36 +530,131 @@ ObjectManager::~ObjectManager() = default;
 
 void ObjectManager::update_interactive_motion(Scene *scene)
 {
-  bool update = false;
+  std::atomic<bool> update{false};
 
   parallel_for(blocked_range<size_t>(0, scene->objects.size(), 32),
                [&](const blocked_range<size_t> &r) {
                  for (size_t i = r.begin(); i != r.end(); i++) {
                    Object *ob = scene->objects[i];
 
-                   const bool use_motion = ob->use_motion();
+                   /* Mutated in place rather than through `set_motion()`, which would copy the
+                    * array per object per update. The modified tagging below reproduces what the
+                    * socket setter did. */
+                   array<Transform> &motion = ob->get_motion();
+                   const bool use_motion = motion.size() > 1;
 
-                   array<Transform> motion = ob->get_motion();
                    if (motion.empty()) {
                      /* Can always store current matrix in motion array with a single element,
                       * since that still causes 'use_motion()' to return false. */
                      motion.resize(1);
+                     motion[0] = ob->tfm;
+                     ob->tag_motion_modified();
                    }
-                   motion[0] = ob->tfm;
+                   else if (motion[0] != ob->tfm) {
+                     motion[0] = ob->tfm;
+                     ob->tag_motion_modified();
 
-                   /* Trigger another update if there was motion compared to previous frame, so
-                    * that last movement does not stick around. */
-                   ob->set_motion(motion);
-
-                   if (use_motion && ob->motion_is_modified()) {
-                     update = true;
+                     /* Trigger another update if there was motion compared to previous frame, so
+                      * that last movement does not stick around. */
+                     if (use_motion) {
+                       update.store(true, std::memory_order_relaxed);
+                     }
                    }
                  }
                });
 
-  if (update) {
-    tag_update(scene, TRANSFORM_MODIFIED);
+  if (update.load(std::memory_order_relaxed)) {
+    /* The device still holds the movement of the frame that was just rendered, and it has to be
+     * settled back to zero before the next one - otherwise every temporal consumer, DLSS included,
+     * keeps reprojecting along a movement that already happened.
+     *
+     * Raising `TRANSFORM_MODIFIED` here is what used to arrange that, but it cascades into the
+     * geometry and light managers and so bought a second full scene update every frame. The
+     * bookkeeping is instead recorded on its own and settled by `device_update_motion_history`,
+     * which rewrites nothing but the motion pass. */
+    motion_history_pending = true;
   }
+}
+
+bool ObjectManager::need_motion_history_flush() const
+{
+  return motion_history_pending;
+}
+
+bool ObjectManager::device_update_motion_history(DeviceScene *dscene, Scene *scene)
+{
+  if (!motion_history_pending) {
+    return true;
+  }
+
+  const Scene::MotionType need_motion = scene->need_motion();
+  if (need_motion != Scene::MOTION_PASS && need_motion != Scene::MOTION_PASS_INTERACTIVE) {
+    /* The pass this settles is not in use, so there is nothing on the device to settle. */
+    motion_history_pending = false;
+    return true;
+  }
+
+  const size_t num_objects = scene->objects.size();
+
+  /* Object indices are only meaningful while the resident arrays still describe this object list.
+   * Adding or removing an object raises a manager flag, so the caller would have taken the regular
+   * path - the checks below are what makes that an invariant rather than an assumption. */
+  if (num_objects == 0 || dscene->object_motion_pass.size() != OBJECT_MOTION_PASS_SIZE * num_objects
+      || dscene->object_flag.size() != num_objects ||
+      dscene->object_motion_pass.device_pointer == 0 || dscene->object_motion_pass.need_realloc() ||
+      dscene->object_flag.need_realloc())
+  {
+    return false;
+  }
+
+  const scoped_callback_timer timer([scene](double time) {
+    if (scene->update_stats) {
+      scene->update_stats->object.times.add_entry({"device_update (motion history)", time});
+    }
+  });
+
+  Transform *object_motion_pass = dscene->object_motion_pass.data();
+  const uint *object_flag = dscene->object_flag.data();
+
+  parallel_for(blocked_range<size_t>(0, num_objects, 32), [&](const blocked_range<size_t> &r) {
+    for (size_t i = r.begin(); i != r.end(); i++) {
+      Object *ob = scene->objects[i];
+
+      /* Collapses the degenerate array the history advance left behind: once the previous slot
+       * holds the current transform there is no motion left to describe. This mirrors what
+       * `device_update_object_transform` does on the regular path. */
+      ob->update_motion();
+
+      Transform tfm_pre;
+      Transform tfm_post;
+      if (ob->use_motion()) {
+        tfm_pre = ob->motion[0];
+        tfm_post = ob->motion[ob->motion.size() - 1];
+      }
+      else {
+        tfm_pre = ob->tfm;
+        tfm_post = ob->tfm;
+      }
+
+      /* Objects carrying deformed positions already have the motion baked into object space. */
+      if (!(object_flag[ob->index] & SD_OBJECT_HAS_VERTEX_MOTION)) {
+        const Transform itfm = transform_inverse(ob->tfm);
+        tfm_pre = tfm_pre * itfm;
+        tfm_post = tfm_post * itfm;
+      }
+
+      const int motion_pass_offset = ob->index * OBJECT_MOTION_PASS_SIZE;
+      object_motion_pass[motion_pass_offset + 0] = tfm_pre;
+      object_motion_pass[motion_pass_offset + 1] = tfm_post;
+    }
+  });
+
+  dscene->object_motion_pass.copy_to_device();
+  dscene->object_motion_pass.clear_modified();
+
+  /* Only cleared once the new state actually reached the device. */
+  motion_history_pending = false;
+  return true;
 }
 
 static float object_volume_density(const Transform &tfm, Geometry *geom)
@@ -562,7 +681,8 @@ static int object_num_motion_verts(Geometry *geom)
 void ObjectManager::device_update_object_transform(UpdateObjectTransformState *state,
                                                    Object *ob,
                                                    bool update_all,
-                                                   const Scene *scene)
+                                                   const Scene *scene,
+                                                   bool buffer_is_fresh)
 {
   KernelObject &kobject = state->objects[ob->index];
   Transform *object_motion_pass = state->object_motion_pass;
@@ -592,8 +712,15 @@ void ObjectManager::device_update_object_transform(UpdateObjectTransformState *s
   kobject.random_number = random_number;
   kobject.particle_index = particle_index;
   kobject.motion_offset = 0;
-  kobject.position_offset = ATTR_STD_NOT_FOUND;
-  kobject.normal_offset = ATTR_STD_NOT_FOUND;
+  /* These three belong to the attribute phase, not to this one: device_update_geom_offsets fills
+   * them in later from the attribute map. Writing sentinels here would make that phase see every
+   * object as changed and upload the whole array a second time - about 7 MB, every frame, purely
+   * to undo what this loop just did. Only a buffer that does not already hold last frame's values
+   * needs them initialised. */
+  if (buffer_is_fresh) {
+    kobject.position_offset = ATTR_STD_NOT_FOUND;
+    kobject.normal_offset = ATTR_STD_NOT_FOUND;
+  }
   kobject.ao_distance = ob->ao_distance;
   kobject.receiver_light_set = ob->receiver_light_set >= LIGHT_LINK_SET_MAX ?
                                    0 :
@@ -703,7 +830,9 @@ void ObjectManager::device_update_object_transform(UpdateObjectTransformState *s
   kobject.numprims = (geom->is_mesh() || geom->is_volume()) ?
                          static_cast<Mesh *>(geom)->num_triangles() :
                          0;
-  kobject.attribute_map_offset = 0;
+  if (buffer_is_fresh) {
+    kobject.attribute_map_offset = 0;
+  }
 
   if (ob->asset_name_is_modified() || update_all) {
     const uint32_t hash_name = util_murmur_hash3(ob->name.c_str(), ob->name.length(), 0);
@@ -757,6 +886,17 @@ void ObjectManager::device_update_object_transform(UpdateObjectTransformState *s
 
 void ObjectManager::device_update_prim_offsets(Device *device, DeviceScene *dscene, Scene *scene)
 {
+  /* Nothing tagged this manager since the last upload, so what is resident still describes the
+   * scene. Cleared here rather than at the end because of the early return below. */
+  const bool offsets_were_dirty = offsets_need_update;
+  offsets_need_update = false;
+
+  if (!offsets_were_dirty && dscene->object_prim_offset.size() == scene->objects.size() &&
+      dscene->object_prim_offset.device_pointer != 0)
+  {
+    return;
+  }
+
   if (!scene->integrator->get_use_light_tree()) {
     const BVHLayoutMask layout_mask = device->get_bvh_layout_mask(dscene->data.kernel_features);
     if (layout_mask != BVH_LAYOUT_METAL && layout_mask != BVH_LAYOUT_MULTI_METAL &&
@@ -766,6 +906,14 @@ void ObjectManager::device_update_prim_offsets(Device *device, DeviceScene *dsce
       return;
     }
   }
+
+  /* Untimed until now, and it has no `need_update()` gate at all: with the light tree enabled this
+   * walks every object and re-uploads the whole array on every scene update. */
+  const scoped_callback_timer timer([scene](double time) {
+    if (scene->update_stats) {
+      scene->update_stats->object.times.add_entry({"device_update_prim_offsets", time});
+    }
+  });
 
   /* On MetalRT, primitive / curve segment offsets can't be baked at BVH build time. Intersection
    * handlers need to apply the offset manually. */
@@ -790,6 +938,45 @@ void ObjectManager::device_update_prim_offsets(Device *device, DeviceScene *dsce
 
 void ObjectManager::device_update_transforms(DeviceScene *dscene, Scene *scene, Progress &progress)
 {
+  /* Where the object manager's 3.3 ms per scene update goes: the parallel pass that fills every
+   * object's kernel record, or the uploads. Reported with its remainder. */
+  static const bool report_parts = getenv("CYCLES_DEBUG_VIEWPORT_PHASES") != nullptr;
+  const double parts_started = time_dt();
+  double ms_prepare = 0.0, ms_fill = 0.0, ms_upload_objects = 0.0, ms_upload_motion = 0.0;
+  auto stamp = [](double &slot, const double started) { slot += (time_dt() - started) * 1000.0; };
+  struct PartsReport {
+    const bool &enabled;
+    const double &started;
+    const double &prepare, &fill, &upload_objects, &upload_motion;
+    ~PartsReport()
+    {
+      if (!enabled) {
+        return;
+      }
+      const double total = (time_dt() - started) * 1000.0;
+      fprintf(stderr,
+              "OBJ_PARTS total=%.2f prepare=%.2f fill=%.2f up_objects=%.2f up_motion=%.2f "
+              "unaccounted=%.2f\n",
+              total,
+              prepare,
+              fill,
+              upload_objects,
+              upload_motion,
+              total - prepare - fill - upload_objects - upload_motion);
+      fflush(stderr);
+    }
+  } parts_report{
+      report_parts, parts_started, ms_prepare, ms_fill, ms_upload_objects, ms_upload_motion};
+
+  const double prepare_started = time_dt();
+
+  /* Whether the array can still hold what the previous update left in it. Taken before `alloc`,
+   * which is what would make the size match. The size check is not redundant with the flag:
+   * `device_vector::alloc` frees and reallocates on a size change without raising `need_realloc`,
+   * so a buffer can be brand new while that flag is clear. */
+  const bool buffer_is_fresh = dscene->objects.need_realloc() ||
+                               dscene->objects.size() != scene->objects.size();
+
   UpdateObjectTransformState state;
   state.need_motion = scene->need_motion();
   state.have_motion = false;
@@ -836,8 +1023,16 @@ void ObjectManager::device_update_transforms(DeviceScene *dscene, Scene *scene, 
     numparticles += psys->particles.size();
   }
 
-  /* as all the arrays are the same size, checking only dscene.objects is sufficient */
-  const bool update_all = dscene->objects.need_realloc();
+  /* Fields that are only written when their own socket changed need writing anyway when the buffer
+   * cannot have kept the previous frame's value - and that is exactly `buffer_is_fresh`, which is
+   * wider than the realloc flag: `device_vector::alloc` frees and reallocates on a size change
+   * without raising it. Asking the flag alone left `cryptomatte_object`, `cryptomatte_asset` and
+   * the decomposed motion transforms holding whatever the allocator returned, for every object
+   * whose own socket happened not to change. */
+  const bool update_all = buffer_is_fresh;
+
+  stamp(ms_prepare, prepare_started);
+  const double fill_started = time_dt();
 
   /* Parallel object update, with grain size to avoid too much threading overhead
    * for individual objects. */
@@ -846,23 +1041,35 @@ void ObjectManager::device_update_transforms(DeviceScene *dscene, Scene *scene, 
                [&](const blocked_range<size_t> &r) {
                  for (size_t i = r.begin(); i != r.end(); i++) {
                    Object *ob = state.scene->objects[i];
-                   device_update_object_transform(&state, ob, update_all, scene);
+                   device_update_object_transform(&state, ob, update_all, scene, buffer_is_fresh);
                  }
                });
+
+  stamp(ms_fill, fill_started);
 
   if (progress.get_cancel()) {
     return;
   }
 
+  const double upload_objects_started = time_dt();
   dscene->objects.copy_to_device_if_modified();
+  stamp(ms_upload_objects, upload_objects_started);
+
+  const double upload_motion_started = time_dt();
   if (state.need_motion == Scene::MOTION_PASS ||
       state.need_motion == Scene::MOTION_PASS_INTERACTIVE)
   {
     dscene->object_motion_pass.copy_to_device();
+
+    /* The full path just wrote every motion transform from the current host state, which subsumes
+     * whatever the narrow flush still had to settle. The history advance at the end of this scene
+     * update raises it again if the objects actually moved. */
+    motion_history_pending = false;
   }
   else if (state.need_motion == Scene::MOTION_BLUR) {
     dscene->object_motion.copy_to_device();
   }
+  stamp(ms_upload_motion, upload_motion_started);
 
   dscene->data.bvh.have_motion = state.have_motion;
   dscene->data.bvh.have_curves = state.have_curves;
@@ -959,6 +1166,9 @@ void ObjectManager::device_update(Device *device,
   }
 
   for (Object *object : scene->objects) {
+    /* Recorded before the flags go: the geometry manager computes bounds after this point and can
+     * no longer tell which objects moved. */
+    object->bounds_need_update = object->bounds_need_update || object->is_modified();
     object->clear_modified();
   }
 }
@@ -999,6 +1209,7 @@ void ObjectManager::device_update_flags(Device * /*unused*/,
   /* Object volume intersection. */
   vector<Object *> volume_objects;
   bool has_volume_objects = false;
+  BoundBox volume_bounds = BoundBox::empty;
   for (Object *object : scene->objects) {
     if (object->geometry->has_volume) {
       /* If the bounds are not valid it is not always possible to calculate the volume step, and
@@ -1006,9 +1217,19 @@ void ObjectManager::device_update_flags(Device * /*unused*/,
        * step size until the final bounds are known. */
       if (bounds_valid) {
         volume_objects.push_back(object);
+        /* Where the media are, for the viewport's volume grid to reach exactly that far and no
+         * further. Recorded here because this is the one place that walks the volume objects with
+         * their final bounds; the grid is built per frame and has no scene to ask. */
+        volume_bounds.grow(object->bounds);
       }
       has_volume_objects = true;
     }
+  }
+
+  if (bounds_valid) {
+    const bool valid = volume_bounds.valid();
+    dscene->data.froxel.bounds_min = valid ? make_float4(volume_bounds.min, 1.0f) : zero_float4();
+    dscene->data.froxel.bounds_max = valid ? make_float4(volume_bounds.max, 1.0f) : zero_float4();
   }
 
   for (Object *object : scene->objects) {
@@ -1067,6 +1288,71 @@ void ObjectManager::device_update_flags(Device * /*unused*/,
   dscene->object_flag.clear_modified();
 }
 
+/* Where a geometry's positions and normals sit inside the attribute map segment starting at
+ * `attr_map_offset`. Pulled out of the object loop so the per-geometry pass and the per-object one
+ * ask the identical question - the object pass now only needs it for objects that carry their own
+ * map. Reads the map, writes nothing, so it is safe to call from several threads. */
+static int geometry_position_offset(const DeviceScene *dscene,
+                                    const Geometry *geom,
+                                    const size_t attr_map_offset)
+{
+  if (geom->is_mesh() || geom->is_volume()) {
+    const int offset = find_attribute(dscene->attributes_map.data(),
+                                      attr_map_offset,
+                                      PRIMITIVE_TRIANGLE,
+                                      ATTR_STD_POSITION)
+                           .offset;
+    assert(offset != ATTR_STD_NOT_FOUND ||
+           static_cast<const Mesh *>(geom)->num_triangles() == 0);
+    return offset;
+  }
+  if (geom->is_hair()) {
+    const int offset = find_attribute(dscene->attributes_map.data(),
+                                      attr_map_offset,
+                                      PRIMITIVE_CURVE_THICK,
+                                      ATTR_STD_POSITION)
+                           .offset;
+    assert(offset != ATTR_STD_NOT_FOUND || static_cast<const Hair *>(geom)->num_keys() == 0);
+    return offset;
+  }
+  if (geom->is_pointcloud()) {
+    const int offset = find_attribute(
+                           dscene->attributes_map.data(), attr_map_offset, PRIMITIVE_POINT,
+                           ATTR_STD_POSITION)
+                           .offset;
+    assert(offset != ATTR_STD_NOT_FOUND ||
+           static_cast<const PointCloud *>(geom)->num_points() == 0);
+    return offset;
+  }
+  return ATTR_STD_NOT_FOUND;
+}
+
+static int geometry_normal_offset(const DeviceScene *dscene,
+                                  const Geometry *geom,
+                                  const size_t attr_map_offset)
+{
+  /* Only meshes and volumes carry normals here; hair and point clouds leave this unset, as before.
+   */
+  if (!geom->is_mesh() && !geom->is_volume()) {
+    return ATTR_STD_NOT_FOUND;
+  }
+
+  int offset = find_attribute(dscene->attributes_map.data(),
+                              attr_map_offset,
+                              PRIMITIVE_TRIANGLE,
+                              ATTR_STD_CORNER_NORMAL)
+                   .offset;
+  if (offset == ATTR_STD_NOT_FOUND) {
+    offset = find_attribute(dscene->attributes_map.data(),
+                            attr_map_offset,
+                            PRIMITIVE_TRIANGLE,
+                            ATTR_STD_VERTEX_NORMAL)
+                 .offset;
+  }
+  assert(offset != ATTR_STD_NOT_FOUND || static_cast<const Mesh *>(geom)->num_triangles() == 0);
+  return offset;
+}
+
 void ObjectManager::device_update_geom_offsets(Device * /*unused*/,
                                                DeviceScene *dscene,
                                                Scene *scene)
@@ -1075,87 +1361,142 @@ void ObjectManager::device_update_geom_offsets(Device * /*unused*/,
     return;
   }
 
+  /* Untimed until now, and ungated: every object is walked and its attribute maps are looked up by
+   * linear scan, so this is O(objects x attributes) on every scene update. */
+  const scoped_callback_timer timer([scene](double time) {
+    if (scene->update_stats) {
+      scene->update_stats->object.times.add_entry({"device_update_geom_offsets", time});
+    }
+  });
+
   KernelObject *kobjects = dscene->objects.data();
 
-  bool update = false;
+  std::atomic<bool> update{false};
 
-  for (Object *object : scene->objects) {
-    Geometry *geom = object->geometry;
+  /* What the lookups below answer depends only on the geometry: every object that has no attribute
+   * map of its own reads the same offsets, out of the same place in the map, as every other object
+   * sharing that geometry. Each lookup is a linear scan of a map segment, so on a scene where
+   * Geometry Nodes turn 837 objects into 33858 instances that is 33858 scans where 837 would do.
+   * Objects that carry their own map offset are computed individually, as before. */
+  struct SharedGeometryOffsets {
+    int position;
+    int normal;
+    int numverts;
+    bool valid = false;
+  };
+  /* Indexed by `Geometry::index`, not hashed. The indices are assigned at the top of
+   * `device_update_attributes` - the function that calls this one - so they are current here. */
+  vector<SharedGeometryOffsets> shared_offsets(scene->geometry.size());
 
-    KernelObject &kobject = kobjects[object->index];
+  /* Resolving each geometry's offsets in its own pass, ahead of the objects.
+   *
+   * The cache used to be filled lazily from inside the object loop, by whichever object reached a
+   * geometry first. That is the one thing preventing the object loop from running in parallel -
+   * everything else in it writes to `kobjects[object->index]`, and those indices are unique and
+   * equal to the object's position. Hoisting the fill removes the dependency without changing a
+   * single value: the same lookups produce the same numbers, just once per geometry instead of
+   * once per object that happens to be first.
+   *
+   * Gating this function on "the attribute map is byte-identical" was considered and rejected. The
+   * map is addressed by layout, not by object-to-offset binding, so an instance rebinding to
+   * another already-present geometry leaves the map identical while its offsets must change - and
+   * on a scene where Geometry Nodes re-emit 33858 instances per frame that is routine, not exotic.
+   * The gate would also have to cover `numverts`, which is not derived from the map at all. A stale
+   * offset points the kernel at another geometry's attribute table, which shows as wrong shading
+   * that never heals; parallelising costs the same milliseconds without inventing that failure. */
+  parallel_for(blocked_range<size_t>(0, scene->geometry.size(), 32),
+               [&](const blocked_range<size_t> &r) {
+                 for (size_t i = r.begin(); i != r.end(); i++) {
+                   Geometry *geom = scene->geometry[i];
+                   if (geom->index < 0 || size_t(geom->index) >= shared_offsets.size()) {
+                     continue;
+                   }
+                   shared_offsets[geom->index] = {
+                       geometry_position_offset(dscene, geom, geom->attr_map_offset),
+                       geometry_normal_offset(dscene, geom, geom->attr_map_offset),
+                       object_num_motion_verts(geom),
+                       true};
+                 }
+               });
 
-    /* An object attribute map cannot have a zero offset because mesh maps come first. */
-    size_t attr_map_offset = object->attr_map_offset;
-    if (attr_map_offset == 0) {
-      attr_map_offset = geom->attr_map_offset;
-    }
+  parallel_for(
+      blocked_range<size_t>(0, scene->objects.size(), 32),
+      [&](const blocked_range<size_t> &range) {
+        bool range_update = false;
 
-    if (kobject.attribute_map_offset != attr_map_offset) {
-      kobject.attribute_map_offset = attr_map_offset;
-      update = true;
-    }
+        for (size_t index = range.begin(); index != range.end(); index++) {
+          Object *object = scene->objects[index];
+          Geometry *geom = object->geometry;
 
-    /* Cached attribute offsets for quick lookup. */
-    int position_offset = ATTR_STD_NOT_FOUND;
-    int normal_offset = ATTR_STD_NOT_FOUND;
-    if (geom->is_mesh() || geom->is_volume()) {
-      position_offset = find_attribute(dscene->attributes_map.data(),
-                                       attr_map_offset,
-                                       PRIMITIVE_TRIANGLE,
-                                       ATTR_STD_POSITION)
-                            .offset;
+          KernelObject &kobject = kobjects[object->index];
 
-      normal_offset = find_attribute(dscene->attributes_map.data(),
-                                     attr_map_offset,
-                                     PRIMITIVE_TRIANGLE,
-                                     ATTR_STD_CORNER_NORMAL)
-                          .offset;
-      if (normal_offset == ATTR_STD_NOT_FOUND) {
-        normal_offset = find_attribute(dscene->attributes_map.data(),
-                                       attr_map_offset,
-                                       PRIMITIVE_TRIANGLE,
-                                       ATTR_STD_VERTEX_NORMAL)
-                            .offset;
-      }
-      assert(position_offset != ATTR_STD_NOT_FOUND ||
-             static_cast<Mesh *>(geom)->num_triangles() == 0);
-      assert(normal_offset != ATTR_STD_NOT_FOUND ||
-             static_cast<Mesh *>(geom)->num_triangles() == 0);
-    }
-    else if (geom->is_hair()) {
-      position_offset = find_attribute(dscene->attributes_map.data(),
-                                       attr_map_offset,
-                                       PRIMITIVE_CURVE_THICK,
-                                       ATTR_STD_POSITION)
-                            .offset;
-      assert(position_offset != ATTR_STD_NOT_FOUND || static_cast<Hair *>(geom)->num_keys() == 0);
-    }
-    else if (geom->is_pointcloud()) {
-      position_offset = find_attribute(dscene->attributes_map.data(),
-                                       attr_map_offset,
-                                       PRIMITIVE_POINT,
-                                       ATTR_STD_POSITION)
-                            .offset;
-      assert(position_offset != ATTR_STD_NOT_FOUND ||
-             static_cast<PointCloud *>(geom)->num_points() == 0);
-    }
-    if (kobject.position_offset != position_offset) {
-      kobject.position_offset = position_offset;
-      update = true;
-    }
-    if (kobject.normal_offset != normal_offset) {
-      kobject.normal_offset = normal_offset;
-      update = true;
-    }
+          /* An object attribute map cannot have a zero offset because mesh maps come first. */
+          size_t attr_map_offset = object->attr_map_offset;
+          const bool shares_geometry_map = (attr_map_offset == 0);
+          if (shares_geometry_map) {
+            attr_map_offset = geom->attr_map_offset;
+          }
 
-    const int numverts = object_num_motion_verts(geom);
-    if (kobject.numverts != numverts) {
-      kobject.numverts = numverts;
-      update = true;
-    }
-  }
+          if (kobject.attribute_map_offset != attr_map_offset) {
+            kobject.attribute_map_offset = attr_map_offset;
+            range_update = true;
+          }
 
-  if (update) {
+          /* Out-of-range would mean a geometry the attribute pass never saw, which cannot happen
+           * while both walk `scene->geometry`; checked anyway so a future reordering degrades to
+           * the slow path rather than reading past the end. */
+          const bool index_usable = geom->index >= 0 &&
+                                    size_t(geom->index) < shared_offsets.size();
+
+          int position_offset;
+          int normal_offset;
+          int numverts;
+
+          if (shares_geometry_map && index_usable && shared_offsets[geom->index].valid) {
+            const SharedGeometryOffsets &cached = shared_offsets[geom->index];
+            position_offset = cached.position;
+            normal_offset = cached.normal;
+            numverts = cached.numverts;
+          }
+          else {
+            /* Object carries its own attribute map, so the offsets are its own. Reads the shared
+             * map without writing anything, which is why this stays inside the parallel range. */
+            position_offset = geometry_position_offset(dscene, geom, attr_map_offset);
+            normal_offset = geometry_normal_offset(dscene, geom, attr_map_offset);
+            numverts = object_num_motion_verts(geom);
+          }
+
+          if (kobject.position_offset != position_offset) {
+            kobject.position_offset = position_offset;
+            range_update = true;
+          }
+          if (kobject.normal_offset != normal_offset) {
+            kobject.normal_offset = normal_offset;
+            range_update = true;
+          }
+          if (kobject.numverts != numverts) {
+            kobject.numverts = numverts;
+            range_update = true;
+          }
+        }
+
+        if (range_update) {
+          update.store(true, std::memory_order_relaxed);
+        }
+      });
+
+  if (update.load(std::memory_order_relaxed)) {
+    /* The whole object array, about 7 MB on a scene with 33858 of them. Reported because it is not
+     * obvious whether anything here actually differs from frame to frame - if it does not, this
+     * never fires, and if it does, it is a bigger cost than the loop that decided it. */
+    static const bool report_upload = getenv("CYCLES_DEBUG_VIEWPORT_PHASES") != nullptr;
+    if (report_upload) {
+      fprintf(stderr,
+              "GEOM_OFFSETS uploaded objects=%zu bytes=%zu\n",
+              scene->objects.size(),
+              dscene->objects.memory_size());
+      fflush(stderr);
+    }
     dscene->objects.copy_to_device();
   }
 }
@@ -1244,6 +1585,17 @@ void ObjectManager::tag_update(Scene *scene, const uint32_t flag)
 {
   update_flags |= flag;
 
+  /* `object_prim_offset` is one primitive offset per object, taken from the object's geometry. Only
+   * a change of which objects there are, of which geometry an object carries, or of the geometry
+   * offsets themselves can move it - and a moving object does none of those. Listing what cannot
+   * affect it rather than what can, so an unrecognised flag still forces the update. */
+  constexpr uint32_t offsets_unaffected = TRANSFORM_MODIFIED | VISIBILITY_MODIFIED |
+                                          HOLDOUT_MODIFIED | PARTICLE_MODIFIED |
+                                          GEOMETRY_MANAGER | OBJECT_MODIFIED;
+  if ((flag & ~offsets_unaffected) != 0) {
+    offsets_need_update = true;
+  }
+
   /* avoid infinite loops if the geometry manager tagged us for an update */
   if ((flag & GEOMETRY_MANAGER) == 0) {
     uint32_t geometry_flag = GeometryManager::OBJECT_MANAGER;
@@ -1265,7 +1617,29 @@ void ObjectManager::tag_update(Scene *scene, const uint32_t flag)
     scene->geometry_manager->tag_update(scene, geometry_flag);
   }
 
-  scene->light_manager->tag_update(scene, LightManager::OBJECT_MANAGER);
+  /* The light manager has no partial path: any reason at all costs a full teardown and rebuild of
+   * the light tree, measured at 5.7 ms on a scene of 33858 instances. Waking it from every object
+   * tag meant paying that on every frame of playback, where 74 objects move and none of them
+   * emits.
+   *
+   * Listed as what cannot reach the light tree rather than what can, so an unrecognised flag still
+   * wakes the manager. Each exclusion is covered elsewhere:
+   *
+   * - TRANSFORM_MODIFIED: moving an emitter or a lamp is tagged directly in `Object::tag_update`,
+   *   which knows whether this object is either. Moving anything else does not enter the tree.
+   * - OBJECT_MODIFIED: the sockets the tree actually reads - light set membership, receiver light
+   *   set, the geometry itself - are each tagged by name there too. The rest of what makes an
+   *   object "modified" (pass id, colour, alpha, asset name, caustics, AO distance, shadow sets)
+   *   is object data in the kernel, not tree structure.
+   * - HOLDOUT_MODIFIED, PARTICLE_MODIFIED: neither is read while building the tree.
+   * - GEOMETRY_MANAGER: the geometry manager tags the light manager on its own account, and this
+   *   flag only exists to stop the two managers tagging each other in a loop. */
+  constexpr uint32_t light_tree_unaffected = TRANSFORM_MODIFIED | OBJECT_MODIFIED |
+                                             HOLDOUT_MODIFIED | PARTICLE_MODIFIED |
+                                             GEOMETRY_MANAGER;
+  if ((flag & ~light_tree_unaffected) != 0) {
+    scene->light_manager->tag_update(scene, LightManager::OBJECT_MANAGER);
+  }
 
   /* Integrator's shadow catcher settings depends on object visibility settings. */
   if (flag & (OBJECT_ADDED | OBJECT_REMOVED | OBJECT_MODIFIED)) {

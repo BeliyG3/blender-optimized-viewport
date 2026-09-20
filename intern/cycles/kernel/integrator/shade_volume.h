@@ -15,6 +15,8 @@
 #include "kernel/integrator/shadow_linking.h"
 #include "kernel/integrator/state.h"
 #include "kernel/integrator/state_flow.h"
+#include "kernel/integrator/volume_froxel.h"
+#include "kernel/integrator/volume_octree.h"
 #include "kernel/integrator/volume_shader.h"
 #include "kernel/integrator/volume_stack.h"
 
@@ -55,15 +57,6 @@ struct VolumeIntegrateResult {
   ShaderVolumePhases indirect_phases;
 };
 
-/* We use both volume octree and volume stack, sometimes they disagree on whether a point is inside
- * a volume or not. We accept small numerical precision issues, above this threshold the volume
- * stack shall prevail. */
-/* TODO(weizhen): tweak this value. */
-#  define OVERLAP_EXP 5e-4f
-/* Restrict the number of steps in case of numerical problems */
-#  define VOLUME_MAX_STEPS 1024
-/* Number of mantissa bits of floating-point numbers. */
-#  define MANTISSA_BITS 23
 
 /* Volume shader properties
  *
@@ -131,174 +124,6 @@ ccl_device_inline bool volume_shader_sample(KernelGlobals kg,
   return true;
 }
 
-/* -------------------------------------------------------------------- */
-/** \name Hierarchical DDA for ray tracing the volume octree
- *
- * Following "Efficient Sparse Voxel Octrees" by Samuli Laine and Tero Karras,
- * and the implementation in https://dubiousconst282.github.io/2024/10/03/voxel-ray-tracing/
- *
- * The ray segment is transformed into octree space [1, 2), with `ray->D` pointing all negative
- * directions. At each ray tracing step, we intersect the backface of the current active leaf node
- * to find `t.max`, then store a point `current_P` which lies in the adjacent leaf node. The next
- * leaf node is found by checking the higher bits of `current_P`.
- *
- * The paper suggests to keep a stack of parent nodes, in practice such a stack (even when the size
- * is just 8) slows down performance on GPU. Instead we store the parent index in the leaf node
- * directly, since there is sufficient space due to alignment.
- *
- * \{ */
-
-struct OctreeTracing {
-  /* Current active leaf node. */
-  ccl_global const KernelOctreeNode *node = nullptr;
-
-  /* Current active ray segment, typically spans from the front face to the back face of the
-   * current leaf node. */
-  Interval<float> t;
-
-  /* Ray origin in octree coordinate space. */
-  packed_float3 ray_P;
-
-  /* Ray direction in octree coordinate space. */
-  packed_float3 ray_D;
-
-  /* Current active position in octree coordinate space. */
-  uint3 current_P;
-
-  /* Object and shader which the octree represents. */
-  VolumeStack entry = {OBJECT_NONE, SHADER_NONE};
-
-  /* Scale of the current active leaf node, relative to the smallest possible size representable by
-   * float. Initialize to the number of float mantissa bits. */
-  uint8_t scale = MANTISSA_BITS;
-  uint8_t next_scale;
-  /* Mark the dimension (x,y,z) to negate the ray so that we find the correct octant. */
-  uint8_t octant_mask;
-
-  /* Whether multiple volumes overlap in the ray segment. */
-  bool no_overlap = false;
-
-  /* Maximum and minimum of the densities in the current segment. */
-  Extrema<float> sigma = 0.0f;
-
-  ccl_device_inline_method OctreeTracing(const float tmin)
-  {
-    /* Initialize t.max to FLT_MAX so that any intersection with the node face is smaller. */
-    t = {tmin, FLT_MAX};
-  }
-
-  enum Dimension { DIM_X = 1U << 0U, DIM_Y = 1U << 1U, DIM_Z = 1U << 2U };
-
-  /* Given ray origin `P` and direction `D` in object space, convert them into octree space
-   * [1.0, 2.0).
-   * Returns false if ray is leaving the octree or octree has degenerate shape. */
-  ccl_device_inline_method bool to_octree_space(ccl_private const float3 &P,
-                                                ccl_private const float3 &D,
-                                                const float3 scale,
-                                                const float3 translation)
-  {
-    if (!isfinite_safe(scale)) {
-      /* Octree with a degenerate shape. */
-      return false;
-    }
-
-    /* Starting point of octree tracing. */
-    float3 local_P = (P + D * t.min) * scale + translation;
-    ray_D = D * scale;
-
-    /* Select octant mask to mirror the coordinate system so that ray direction is negative along
-     * each axis, and adjust `local_P` accordingly. */
-    const auto positive = ray_D > 0.0f;
-    octant_mask = (!!positive.x * DIM_X) | (!!positive.y * DIM_Y) | (!!positive.z * DIM_Z);
-    local_P = select(positive, 3.0f - local_P, local_P);
-
-    /* Clamp to the largest floating-point number smaller than 2.0f, for numerical stability. */
-    local_P = min(local_P, make_float3(1.9999999f));
-    current_P = float3_as_uint3(local_P);
-
-    ray_D = -fabs(ray_D);
-
-    /* Ray origin. */
-    ray_P = local_P - ray_D * t.min;
-
-    /* Returns false if point lies outside of the octree and the ray is leaving the octree. */
-    return all(local_P > 1.0f);
-  }
-
-  /* Find the bounding box min of the node that `current_P` lies in within the current scale. */
-  ccl_device_inline_method float3 floor_pos() const
-  {
-    /* Erase bits lower than scale. */
-    const uint mask = ~0u << scale;
-    return make_float3(__uint_as_float(current_P.x & mask),
-                       __uint_as_float(current_P.y & mask),
-                       __uint_as_float(current_P.z & mask));
-  }
-
-  /* Find arbitrary position inside the next node.
-   * We use the end of the current segment offsetted by half of the minimal node size in the normal
-   * direction of the last face intersection. */
-  ccl_device_inline_method void find_next_pos(const float3 bbox_min,
-                                              const float3 t,
-                                              const float tmax)
-  {
-    constexpr float half_size = 1.0f / (2 << VOLUME_OCTREE_MAX_DEPTH);
-    const uint3 next_P = float3_as_uint3(
-        select(t == tmax, bbox_min - half_size, ray_D * tmax + ray_P));
-
-    /* Find the nearest common ancestor of two positions by checking the shared higher bits. */
-    const uint diff = (current_P.x ^ next_P.x) | (current_P.y ^ next_P.y) |
-                      (current_P.z ^ next_P.z);
-
-    current_P = next_P;
-    next_scale = 32u - count_leading_zeros(diff);
-  }
-
-  /* See `ray_aabb_intersect()`. We only need to intersect the 3 back sides because the ray
-   * direction is all negative. */
-  ccl_device_inline_method float ray_voxel_intersect(const float ray_tmax)
-  {
-    const float3 bbox_min = floor_pos();
-
-    /* Distances to the three surfaces. */
-    float3 intersect_t = (bbox_min - ray_P) / ray_D;
-
-    /* Select the smallest element that is larger than `t.min`, to avoid self intersection. */
-    intersect_t = select(intersect_t > t.min, intersect_t, make_float3(FLT_MAX));
-
-    /* The first intersection is given by the smallest t. */
-    const float tmax = reduce_min(intersect_t);
-
-    find_next_pos(bbox_min, intersect_t, tmax);
-
-    return fminf(tmax, ray_tmax);
-  }
-
-  /* Returns the octant of `current_P` in the node at given scale. */
-  ccl_device_inline_method int get_octant() const
-  {
-    const uint8_t x = (current_P.x >> scale) & 1u;
-    const uint8_t y = ((current_P.y >> scale) & 1u) << 1u;
-    const uint8_t z = ((current_P.z >> scale) & 1u) << 2u;
-    return (x | y | z) ^ octant_mask;
-  }
-};
-
-/* Check if an octree node is leaf node. */
-ccl_device_inline bool volume_node_is_leaf(const ccl_global KernelOctreeNode *knode)
-{
-  return knode->first_child == -1;
-}
-
-/* Find the leaf node of the current position, and replace `octree.node` with that node. */
-ccl_device void volume_voxel_get(KernelGlobals kg, ccl_private OctreeTracing &octree)
-{
-  while (!volume_node_is_leaf(octree.node)) {
-    octree.scale -= 1;
-    const int child_index = octree.node->first_child + octree.get_octant();
-    octree.node = &kernel_data_fetch(volume_tree_nodes, child_index);
-  }
-}
 
 /* If there exists a Light Path Node, it could affect the density evaluation at runtime.
  * Randomly sample a few points on the ray to estimate the extrema. */
@@ -386,19 +211,6 @@ ccl_device_inline Extrema<float> volume_object_get_extrema(KernelGlobals kg,
 #  endif
 }
 
-/* Find the octree root node in the kernel array that corresponds to the volume stack entry. */
-ccl_device_inline const ccl_global KernelOctreeRoot *volume_find_octree_root(
-    KernelGlobals kg, const VolumeStack entry)
-{
-  int root = kernel_data_fetch(volume_tree_root_ids, entry.object);
-  const ccl_global KernelOctreeRoot *kroot = &kernel_data_fetch(volume_tree_roots, root);
-  while ((entry.shader & SHADER_MASK) != kroot->shader) {
-    /* If one object has multiple shaders, we store the index of the last shader, and search
-     * backwards for the octree with the corresponding shader. */
-    kroot = &kernel_data_fetch(volume_tree_roots, --root);
-  }
-  return kroot;
-}
 
 /* Find the current active ray segment.
  * We might have multiple overlapping octrees, so find the smallest `tmax` of all and store the
@@ -853,6 +665,12 @@ struct VolumeIntegrateState {
   float majorant_scale;
   /* Scale to apply after direct throughput due to Russian Roulette. */
   float direct_rr_scale;
+
+  /* How much of this pixel the medium accounts for, `1 - transmittance` over the whole segment.
+   * Analytic, so it is the same for every sample - unlike `transmittance` above, which is a ratio
+   * tracking estimate. Used to weight the medium's motion vector against the surface's: a thin
+   * haze in front of an object should barely move the vector, a dense one should own it. */
+  float coverage;
 
   /* Extra fields for path guiding and denoising. */
   PackedSpectrum emission;
@@ -1612,12 +1430,19 @@ ccl_device_inline void volume_integrate_state_init(KernelGlobals kg,
   vstate.t = tmin;
   vstate.optical_depth = 0.0f;
   vstate.step = 0;
-  /* Only guide primary rays. */
-  vstate.vspg = (INTEGRATOR_STATE(state, path, bounce) == 0);
+  /* Only guide primary rays, and only when guiding is enabled at all. Switching it off here turns
+   * every other guiding branch into its plain counterpart, and leaves the guide passes allocated -
+   * several `kernel_assert`s rely on them existing. */
+  vstate.vspg = (INTEGRATOR_STATE(state, path, bounce) == 0) &&
+                kernel_data.integrator.volume_scatter_guiding;
   vstate.scatter_prob = 1.0f;
   vstate.majorant_scale = 1.0f;
   vstate.direct_rr_scale = 1.0f;
   vstate.emission = zero_spectrum();
+  /* Assume the medium owns the pixel until a branch that can measure it says otherwise. That is
+   * what the homogeneous path does; ray marching leaves it at one, which reproduces the previous
+   * behaviour there. */
+  vstate.coverage = 1.0f;
 #  ifdef __DENOISING_FEATURES__
   vstate.albedo = zero_spectrum();
 #  endif
@@ -1647,6 +1472,197 @@ ccl_device_inline void volume_integrate_result_init(
 #  endif
 }
 
+/* Which point a scattered sample should hand reconstruction as this pixel's position.
+ *
+ * The entry point into the medium is right for a pixel that is nothing but fog, and writing it is
+ * what removed the fog's ghosting. It is wrong for a pixel that shows an object through the fog:
+ * that object is what the eye sees move, and its parallax differs from the medium's front face by
+ * several pixels.
+ *
+ * Which of the two a pixel gets used to depend on whether the sample happened to scatter, since a
+ * transmitted path reaches the surface and writes the surface's vector itself. With this medium a
+ * sample scatters about 94% of the time, so withholding the write on a scattered sample - which is
+ * what the previous mode did - left the weight at zero almost always, and a zero vector reads as
+ * "did not move". Measured lag: the lava trailed 0.9 of a camera step, the tank 0.31.
+ *
+ * The end of the segment is known regardless: `integrator_shade_volume_setup` bounded the ray with
+ * the intersection before any scatter was drawn. Ending on the medium's own hull does not end the
+ * pixel - more medium or the background follows - so those keep the entry point. */
+/* Where along the segment the light this pixel shows was scattered, on average, given that it was
+ * scattered at all: `E[t | t < L]` for a free path with density `sigma_t`.
+ *
+ * A single sample scatters wherever the random draw sends it, and a point built from that jitters
+ * from frame to frame - which is what made the first attempt at a volume motion vector grainy. This
+ * is the mean of that distribution, so every sample of the pixel agrees on it, and it sits one mean
+ * free path into the medium rather than on its front face, which is where the fog actually looks
+ * like it is. Thin media fall back to the middle of the segment, which is what the expression tends
+ * to as the optical depth goes to zero. */
+ccl_device_inline float volume_denoising_representative_t(const ccl_private Ray *ccl_restrict ray,
+                                                          const float optical_depth)
+{
+  const float length = ray->tmax - ray->tmin;
+  if (!(length > 0.0f)) {
+    return ray->tmin;
+  }
+
+  const float tau = fmaxf(optical_depth, 0.0f);
+  if (tau < 1e-4f) {
+    return ray->tmin + 0.5f * length;
+  }
+
+  const float e = expf(-tau);
+  const float denom = tau * (1.0f - e);
+  if (!(denom > 1e-12f)) {
+    return ray->tmin + 0.5f * length;
+  }
+
+  /* `length * (1 - (1 + tau) e^-tau) / (tau (1 - e^-tau))`, which is `1/sigma_t` for a thick
+   * medium and `length / 2` for a thin one. */
+  const float fraction = clamp((1.0f - (1.0f + tau) * e) / denom, 0.0f, 1.0f);
+  return ray->tmin + length * fraction;
+}
+
+ccl_device_inline float3 volume_denoising_reference_P(KernelGlobals kg,
+                                                      const IntegratorState state,
+                                                      const ccl_private Ray *ccl_restrict ray,
+                                                      const float optical_depth)
+{
+  const float3 entry_P = ray->P + ray->D * ray->tmin;
+
+  if ((kernel_data.film.denoising_pass_options_flag &
+       DENOISING_PASS_VOLUME_MOTION_SEGMENT_END) == 0)
+  {
+    return entry_P;
+  }
+
+  const bool representative = (kernel_data.film.denoising_pass_options_flag &
+                               DENOISING_PASS_VOLUME_DEPTH_REPRESENTATIVE) != 0;
+  const float3 medium_P = representative ?
+                              ray->P + ray->D * volume_denoising_representative_t(ray,
+                                                                                  optical_depth) :
+                              entry_P;
+
+  const int prim = INTEGRATOR_STATE(state, isect, prim);
+  if (prim == PRIM_NONE) {
+    /* The background follows; nothing nearer describes the pixel. */
+    return medium_P;
+  }
+  if (INTEGRATOR_STATE(state, isect, object) ==
+      INTEGRATOR_STATE_ARRAY(state, volume_stack, 0, object))
+  {
+    return medium_P;
+  }
+
+  return ray->P + ray->D * ray->tmax;
+}
+
+/* How much depth a scattered sample still owes, so that the guide describes the point the vector
+ * was built from.
+ *
+ * The pass accumulates deltas: the medium's bounding surface already wrote the camera depth of the
+ * entry point, and a transmitted path adds the rest when it shades the surface behind the fog. A
+ * scattered path never gets there, so the pixel keeps the depth of the fog's front face while its
+ * vector describes the object - two different places, which is what reconstruction refuses to
+ * confirm. Adding the remainder here makes both branches land on the same number.
+ *
+ * Ending on the medium's own hull owes nothing: more medium or the background follows, and the
+ * entry point is still what describes the pixel. */
+/* The normal a scattered sample should hand reconstruction, in camera space.
+ *
+ * `(0,0,-1)` with full roughness is what a scattering event deserves - a phase function is close to
+ * a diffuse lobe facing nowhere in particular - and it is all there is for a pixel that is only
+ * fog. Where an object ends the segment, that object's normal is what the pixel shows, and the
+ * intersection needed to compute it was found before the scatter was drawn.
+ *
+ * Only plain triangles: a motion triangle would need its vertices at the right time, which is more
+ * work than a guide is worth, and everything else keeps the facing normal. */
+ccl_device_inline float3 volume_denoising_reference_N(KernelGlobals kg,
+                                                      const IntegratorState state,
+                                                      const ccl_private Ray *ccl_restrict ray)
+{
+  const float3 facing = make_float3(0.0f, 0.0f, -1.0f);
+
+  if ((kernel_data.film.denoising_pass_options_flag & DENOISING_PASS_VOLUME_SURFACE_NORMAL) == 0) {
+    return facing;
+  }
+
+  const int prim = INTEGRATOR_STATE(state, isect, prim);
+  if (prim == PRIM_NONE) {
+    return facing;
+  }
+  const int object = INTEGRATOR_STATE(state, isect, object);
+  if (object == INTEGRATOR_STATE_ARRAY(state, volume_stack, 0, object)) {
+    return facing;
+  }
+  if ((INTEGRATOR_STATE(state, isect, type) & PRIMITIVE_TRIANGLE) == 0) {
+    return facing;
+  }
+
+  float3 P;
+  float3 Ng;
+  int shader;
+  triangle_point_normal(kg,
+                        object,
+                        prim,
+                        INTEGRATOR_STATE(state, isect, u),
+                        INTEGRATOR_STATE(state, isect, v),
+                        &P,
+                        &Ng,
+                        &shader);
+
+  const uint object_flag = kernel_data_fetch(object_flag, object);
+  if ((object_flag & SD_OBJECT_TRANSFORM_APPLIED) == 0) {
+    const Transform itfm = object_fetch_transform(kg, object, OBJECT_INVERSE_TRANSFORM);
+    Ng = normalize(transform_direction_transposed(&itfm, Ng));
+  }
+
+  /* Face the camera, the way a shading normal handed to a denoiser does. */
+  if (dot(Ng, ray->D) > 0.0f) {
+    Ng = -Ng;
+  }
+
+  const Transform worldtocamera = kernel_data.cam.worldtocamera;
+  return transform_direction(&worldtocamera, Ng);
+}
+
+ccl_device_inline float volume_denoising_reference_depth_delta(KernelGlobals kg,
+                                                               const IntegratorState state,
+                                                               const ccl_private Ray *ccl_restrict
+                                                                   ray,
+                                                               const float optical_depth)
+{
+  if ((kernel_data.film.denoising_pass_options_flag &
+       DENOISING_PASS_VOLUME_DEPTH_SEGMENT_END) == 0)
+  {
+    return 0.0f;
+  }
+
+  const float entry_z = camera_z_depth(kg, ray->P + ray->D * ray->tmin);
+
+  /* The medium owns the pixel outright here, so the depth is that of the point the motion vector
+   * was built from and nothing the path reaches later adds to it. */
+  if ((kernel_data.film.denoising_pass_options_flag &
+       DENOISING_PASS_VOLUME_DEPTH_REPRESENTATIVE) != 0)
+  {
+    return camera_z_depth(kg, volume_denoising_reference_P(kg, state, ray, optical_depth)) - entry_z;
+  }
+
+  const int prim = INTEGRATOR_STATE(state, isect, prim);
+  if (prim == PRIM_NONE) {
+    /* Nothing in front of the background. Without this the pixel alternates between the front
+     * face's depth and what the background writes, which reads as geometry appearing and
+     * vanishing. */
+    return VOLUME_DENOISING_FAR_DEPTH - entry_z;
+  }
+  if (INTEGRATOR_STATE(state, isect, object) ==
+      INTEGRATOR_STATE_ARRAY(state, volume_stack, 0, object))
+  {
+    return 0.0f;
+  }
+
+  return camera_z_depth(kg, ray->P + ray->D * ray->tmax) - entry_z;
+}
+
 /* Compute guided volume scatter probability and the majorant scale needed for achieving the
  * scatter probability, for homogeneous volume. */
 ccl_device_inline Spectrum
@@ -1666,6 +1682,17 @@ volume_scatter_probability_homogeneous(KernelGlobals kg,
   const Spectrum attenuation = 1.0f - volume_color_transmittance(coeff.sigma_t, ray_length);
   if (!vstate.vspg) {
     return attenuation;
+  }
+
+  /* Measurement override: pin the probability instead of asking the guiding for it. It has to sit
+   * behind the `vspg` check - `vstate.vspg` is only set on primary rays, and overriding ahead of
+   * it replaces the probability on every bounce, which changes multiple scattering and darkens
+   * the image by more than a tenth. The estimator stays unbiased for any value here because the
+   * caller divides by the same number it branches on. Zero extinction still means no scattering,
+   * so the channel mask is kept. */
+  const float probability_override = kernel_data.integrator.volume_scatter_probability_override;
+  if (probability_override >= 0.0f) {
+    return select(coeff.sigma_t > 0.0f, make_spectrum(probability_override), zero_spectrum());
   }
 
   const ccl_global float *buffer = film_pass_pixel_render_buffer(kg, state, render_buffer);
@@ -1696,8 +1723,9 @@ volume_scatter_probability_homogeneous(KernelGlobals kg,
         safe_divide(L_scattered, L_volume) * scale, zero_spectrum(), one_spectrum());
   }
 
-  /* Defensive sampling. */
-  return mix(attenuation, guided_scatter_prob, 0.75f);
+  /* Defensive sampling. The weight is a constant in upstream; here it is a knob, because the
+   * measured cost of moving it is the whole point of the sweep. */
+  return mix(attenuation, guided_scatter_prob, kernel_data.integrator.volume_scatter_guiding_mix);
 }
 
 /* Homogeneous volume distance sampling, using analytic solution to avoid drawing multiple samples
@@ -1746,6 +1774,7 @@ ccl_device_forceinline void volume_integrate_homogeneous(KernelGlobals kg,
   const Spectrum albedo = safe_divide_color(coeff.sigma_s, coeff.sigma_t);
   /* Multiple scattering albedo. */
   vstate.albedo = albedo * (1.0f - transmittance) * throughput;
+  vstate.coverage = clamp(average(one_spectrum() - transmittance), 0.0f, 1.0f);
 
   /* Indirect scatter. */
   {
@@ -1979,8 +2008,17 @@ ccl_device void volume_integrate_null_scattering(KernelGlobals kg,
 #  ifdef __DENOISING_FEATURES__
   /* Write denoising features. */
   if (INTEGRATOR_STATE(state, path, flag) & PATH_RAY_DENOISING_FEATURES) {
-    film_write_denoising_features_volume(
-        kg, state, vstate.albedo, result.indirect_scatter, render_buffer);
+    film_write_denoising_features_volume(kg,
+                                         state,
+                                         vstate.albedo,
+                                         result.indirect_scatter,
+                                         volume_denoising_reference_P(
+                                             kg, state, ray, vstate.optical_depth),
+                                         volume_denoising_reference_depth_delta(
+                                             kg, state, ray, vstate.optical_depth),
+                                         volume_denoising_reference_N(kg, state, ray),
+                                         vstate.coverage,
+                                         render_buffer);
   }
 #  endif /* __DENOISING_FEATURES__ */
 
@@ -2403,8 +2441,21 @@ ccl_device_forceinline void volume_integrate_ray_marching(
 #  ifdef __DENOISING_FEATURES__
   /* Write denoising features. */
   if (write_denoising_features) {
-    film_write_denoising_features_volume(
-        kg, state, accum_albedo, result.indirect_scatter, render_buffer);
+    film_write_denoising_features_volume(kg,
+                                         state,
+                                         accum_albedo,
+                                         result.indirect_scatter,
+                                         /* Ray marching keeps no optical depth for the segment -
+                                          * its state is only the sampling decisions - and working
+                                          * one out would mean summing extinction inside the step
+                                          * loop. Zero reads as "unknown" and puts the medium's
+                                          * point in the middle of the segment, which is where the
+                                          * expression tends as the optical depth goes to zero. */
+                                         volume_denoising_reference_P(kg, state, ray, 0.0f),
+                                         volume_denoising_reference_depth_delta(kg, state, ray, 0.0f),
+                                         volume_denoising_reference_N(kg, state, ray),
+                                         1.0f,
+                                         render_buffer);
   }
 #  endif /* __DENOISING_FEATURES__ */
 }
@@ -2836,6 +2887,13 @@ ccl_device VolumeIntegrateEvent volume_integrate(KernelGlobals kg,
     return VOLUME_PATH_ATTENUATED;
   }
 
+  /* While the viewport is being moved, the medium comes from the camera-aligned grid instead of
+   * being traced. The surface behind it is still traced and still multiplied by this
+   * transmittance, so its edge stays sharp. */
+  if (volume_froxel_shade(kg, state, ray, render_buffer)) {
+    return VOLUME_PATH_ATTENUATED;
+  }
+
   ShaderData sd;
   /* FIXME: `object` is used for light linking. We read the bottom of the stack for simplicity, but
    * this does not work for overlapping volumes. */
@@ -2871,6 +2929,13 @@ volume_integrate_ray_marching(KernelGlobals kg,
   kernel_assert(kernel_data.integrator.volume_ray_marching);
 
   if (integrator_state_volume_stack_is_empty(kg, state)) {
+    return VOLUME_PATH_ATTENUATED;
+  }
+
+  /* While the viewport is being moved, the medium comes from the camera-aligned grid instead of
+   * being traced. The surface behind it is still traced and still multiplied by this
+   * transmittance, so its edge stays sharp. */
+  if (volume_froxel_shade(kg, state, ray, render_buffer)) {
     return VOLUME_PATH_ATTENUATED;
   }
 

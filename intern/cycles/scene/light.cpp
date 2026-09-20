@@ -1059,19 +1059,38 @@ void LightManager::device_update_tree(Device * /*unused*/,
   KernelIntegrator *kintegrator = &dscene->data.integrator;
 
   if (!kintegrator->use_light_tree) {
+    /* Nothing below will refill these, so this is where they are released - the update path no
+     * longer drops them up front. Mirrors what `device_update_distribution` does for its own array
+     * on the opposite branch. */
+    dscene->light_tree_nodes.free();
+    dscene->light_tree_emitters.free();
+    dscene->light_to_tree.free();
+    dscene->object_lookup_offset.free();
+    dscene->triangle_to_tree.free();
     return;
   }
 
   /* Update light tree. */
   progress.set_status("Updating Lights", "Computing tree");
 
+  /* Splitting the enumeration from the build. The tree on this scene has one emitter and three
+   * nodes, so building it is nothing - but the constructor walks all 33858 objects to find that
+   * one emitter, and fills a lookup entry per object. That is the shape of the cost, and it is
+   * proportional to the scene rather than to the lights in it. */
+  static const bool report_tree = getenv("CYCLES_DEBUG_VIEWPORT_PHASES") != nullptr;
+  const double enumerate_started = time_dt();
+
   /* TODO: For now, we'll start with a smaller number of max lights in a node.
    * More benchmarking is needed to determine what number works best. */
   LightTree light_tree(scene, dscene, progress, 8);
+  const double build_started = time_dt();
   LightTreeNode *root = light_tree.build(scene, dscene);
+  const double flatten_started = time_dt();
   if (progress.get_cancel()) {
     return;
   }
+
+  const double alloc_started = time_dt();
 
   /* Create arguments for recursive tree flatten. */
   LightTreeFlatten flatten;
@@ -1097,6 +1116,25 @@ void LightManager::device_update_tree(Device * /*unused*/,
 
   LOG_INFO << "Use light tree with " << num_emitters << " emitters and " << light_tree.num_nodes
            << " nodes.";
+
+  /* What the 5.7 ms of tree build is proportional to. Whether an incremental tree is worth its
+   * risk depends on this: a tree of a few emitters that rebuilds in microseconds is not the same
+   * problem as one of tens of thousands. */
+  if (report_tree) {
+    fprintf(stderr,
+            "LIGHT_TREE emitters=%zu nodes=%d triangles=%d linking=%d objects=%zu "
+            "enumerate=%.2f build=%.2f\n",
+            num_emitters,
+            light_tree.num_nodes.load(),
+            light_tree.num_triangles,
+            int(use_light_linking),
+            scene->objects.size(),
+            (build_started - enumerate_started) * 1000.0,
+            (flatten_started - build_started) * 1000.0);
+    fflush(stderr);
+  }
+
+  const double flatten_body_started = time_dt();
 
   if (!use_light_linking) {
     /* Regular light tree without linking. */
@@ -1145,12 +1183,37 @@ void LightManager::device_update_tree(Device * /*unused*/,
              << light_link_nodes.size() - light_tree.num_nodes << " additional nodes.";
   }
 
-  /* Copy arrays to device. */
+  const double upload_started = time_dt();
+
+  /* Copy arrays to device. Timed one by one: each of these is a MEM_GLOBAL buffer, and every
+   * upload to one is a synchronous copy on the default stream plus a write of the new pointer
+   * into the kernel parameters - so five uploads are five points where the host waits on the GPU,
+   * whatever their size. Knowing which of the five carries the 4.9 ms decides whether the fix is
+   * to skip unchanged tables or something else entirely. */
   dscene->light_tree_nodes.copy_to_device();
+  const double t_nodes = time_dt();
   dscene->light_tree_emitters.copy_to_device();
+  const double t_emitters = time_dt();
   dscene->light_to_tree.copy_to_device();
+  const double t_lookup = time_dt();
   dscene->object_lookup_offset.copy_to_device();
+  const double t_offset = time_dt();
   dscene->triangle_to_tree.copy_to_device();
+
+  if (report_tree) {
+    fprintf(stderr,
+            "LIGHT_TAIL alloc=%.2f flatten=%.2f upload=%.2f nodes=%.2f emitters=%.2f "
+            "light_to_tree=%.2f object_lookup=%.2f tri_to_tree=%.2f\n",
+            (flatten_body_started - alloc_started) * 1000.0,
+            (upload_started - flatten_body_started) * 1000.0,
+            (time_dt() - upload_started) * 1000.0,
+            (t_nodes - upload_started) * 1000.0,
+            (t_emitters - t_nodes) * 1000.0,
+            (t_lookup - t_emitters) * 1000.0,
+            (t_offset - t_lookup) * 1000.0,
+            (time_dt() - t_offset) * 1000.0);
+    fflush(stderr);
+  }
 }
 
 static void background_cdf(int start,
@@ -1465,34 +1528,127 @@ void LightManager::device_update(Device *device,
     }
   });
 
+  /* Sub-step timings. The manager rebuilds its whole structure on every update - it reads no
+   * sub-flag, so any tagged reason costs the same full teardown and rebuild - and until now all of
+   * that was reported as a single `device_update` entry, which made it impossible to tell whether
+   * the cost sits in the emitter enumeration, the distribution or the tree. */
+  auto sub_timer = [scene](const char *name) {
+    return scoped_callback_timer([scene, name](double time) {
+      if (scene->update_stats) {
+        scene->update_stats->light.times.add_entry({name, time});
+      }
+    });
+  };
+
+  /* The sub-timers above only surface through the update statistics, which the viewport does not
+   * collect, so this manager was the one large stage with no breakdown in the phase log - it
+   * measures 7.2 ms of a 34.5 ms scene update, more than any other. `flags` is what makes the
+   * breakdown actionable: it names who woke the manager, and a reason that turns out not to need a
+   * rebuilt light tree can be gated instead of the rebuild being made cheaper. */
+  static const bool report_parts = getenv("CYCLES_DEBUG_VIEWPORT_PHASES") != nullptr;
+  const uint32_t entry_flags = update_flags;
+  const double parts_started = time_dt();
+  double ms_enabled = 0.0, ms_free = 0.0, ms_lights = 0.0, ms_background = 0.0;
+  double ms_distribution = 0.0, ms_tree = 0.0, ms_ies = 0.0;
+  auto stamp = [](double &slot, const double started) { slot += (time_dt() - started) * 1000.0; };
+  struct PartsReport {
+    const bool &enabled;
+    const uint32_t &flags;
+    const double &started;
+    const double &test_enabled, &free_, &lights, &background, &distribution, &tree, &ies;
+    ~PartsReport()
+    {
+      if (!enabled) {
+        return;
+      }
+      const double total = (time_dt() - started) * 1000.0;
+      fprintf(stderr,
+              "LIGHT_PARTS total=%.2f flags=0x%x enabled=%.2f free=%.2f lights=%.2f "
+              "background=%.2f distribution=%.2f tree=%.2f ies=%.2f unaccounted=%.2f\n",
+              total,
+              flags,
+              test_enabled,
+              free_,
+              lights,
+              background,
+              distribution,
+              tree,
+              ies,
+              total - test_enabled - free_ - lights - background - distribution - tree - ies);
+      fflush(stderr);
+    }
+  } parts_report{report_parts,
+                 entry_flags,
+                 parts_started,
+                 ms_enabled,
+                 ms_free,
+                 ms_lights,
+                 ms_background,
+                 ms_distribution,
+                 ms_tree,
+                 ms_ies};
+
   /* Detect which lights are enabled, also determines if we need to update the background. */
-  test_enabled_lights(scene);
+  {
+    const scoped_callback_timer step = sub_timer("device_update (test enabled lights)");
+    const double started = time_dt();
+    test_enabled_lights(scene);
+    stamp(ms_enabled, started);
+  }
 
-  device_free(device, dscene, need_update_background);
+  {
+    const scoped_callback_timer step = sub_timer("device_update (free)");
+    const double started = time_dt();
+    device_free(device, dscene, need_update_background, false);
+    stamp(ms_free, started);
+  }
 
-  device_update_lights(dscene, scene);
+  {
+    const scoped_callback_timer step = sub_timer("device_update (lights)");
+    const double started = time_dt();
+    device_update_lights(dscene, scene);
+    stamp(ms_lights, started);
+  }
   if (progress.get_cancel()) {
     return;
   }
 
   if (need_update_background) {
+    const scoped_callback_timer step = sub_timer("device_update (background)");
+    const double started = time_dt();
     device_update_background(device, dscene, scene, progress);
+    stamp(ms_background, started);
     if (progress.get_cancel()) {
       return;
     }
   }
 
-  device_update_distribution(device, dscene, scene, progress);
+  {
+    const scoped_callback_timer step = sub_timer("device_update (distribution)");
+    const double started = time_dt();
+    device_update_distribution(device, dscene, scene, progress);
+    stamp(ms_distribution, started);
+  }
   if (progress.get_cancel()) {
     return;
   }
 
-  device_update_tree(device, dscene, scene, progress);
+  {
+    const scoped_callback_timer step = sub_timer("device_update (tree)");
+    const double started = time_dt();
+    device_update_tree(device, dscene, scene, progress);
+    stamp(ms_tree, started);
+  }
   if (progress.get_cancel()) {
     return;
   }
 
-  device_update_ies(dscene);
+  {
+    const scoped_callback_timer step = sub_timer("device_update (ies)");
+    const double started = time_dt();
+    device_update_ies(dscene);
+    stamp(ms_ies, started);
+  }
   if (progress.get_cancel()) {
     return;
   }
@@ -1503,21 +1659,35 @@ void LightManager::device_update(Device *device,
 
 void LightManager::device_free(Device * /*unused*/,
                                DeviceScene *dscene,
-                               const bool free_background)
+                               const bool free_background,
+                               const bool release_device_memory)
 {
-  dscene->light_tree_nodes.free();
-  dscene->light_tree_emitters.free();
-  dscene->light_to_tree.free();
-  dscene->object_lookup_offset.free();
-  dscene->triangle_to_tree.free();
+  /* `device_update` used to come through here and drop every one of these buffers, then allocate
+   * them straight back at the same size a few microseconds later. The host side of that is free -
+   * but the device side is not: releasing the device allocation zeroes `device_pointer`, so the
+   * following `copy_to_device` has to allocate again, and a device allocation blocks until the
+   * GPU has drained. Measured at 4.9 ms of upload for 270 KB of actual data.
+   *
+   * `alloc()` already frees and reallocates by itself when the size changes, and keeps the buffer
+   * when it does not, so on the update path the free is not needed for correctness either - the
+   * one thing it does provide is releasing a buffer that this update will not refill, and the
+   * three places where that can happen release theirs explicitly. */
+  if (release_device_memory) {
+    dscene->light_tree_nodes.free();
+    dscene->light_tree_emitters.free();
+    dscene->light_to_tree.free();
+    dscene->object_lookup_offset.free();
+    dscene->triangle_to_tree.free();
 
-  dscene->light_distribution.free();
-  dscene->lights.free();
+    dscene->light_distribution.free();
+    dscene->lights.free();
+    dscene->ies_lights.free();
+  }
+
   if (free_background) {
     dscene->light_background_marginal_cdf.free();
     dscene->light_background_conditional_cdf.free();
   }
-  dscene->ies_lights.free();
 }
 
 void LightManager::tag_update(Scene * /*scene*/, uint32_t flag)
@@ -1653,6 +1823,11 @@ void LightManager::device_update_ies(DeviceScene *dscene)
     }
 
     dscene->ies_lights.copy_to_device();
+  }
+  else {
+    /* No slots left to pack, so nothing refills this one - released here for the same reason the
+     * light tree arrays are released on their empty branch. */
+    dscene->ies_lights.free();
   }
 }
 

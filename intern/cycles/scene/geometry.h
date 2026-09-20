@@ -9,6 +9,7 @@
 #include "bvh/params.h"
 
 #include "scene/attribute.h"
+#include "scene/geometry_layout.h"
 
 #include "util/boundbox.h"
 #include "util/set.h"
@@ -130,6 +131,14 @@ class Geometry : public Node {
   bool need_update_rebuild;
   bool need_update_bvh_for_offset;
 
+  /* Whether the positions may have changed since the interactive motion pass last swapped them
+   * into the previous-frame slot. Set by every path that writes positions - the sync paths via
+   * `tag_update()`, and in-place writers via `get_position_for_write()` /
+   * `tag_position_modified()`. Consumed and cleared by
+   * `GeometryManager::update_interactive_motion()`, which would otherwise compare every vertex of
+   * every geometry on every scene update. */
+  bool need_update_interactive_motion;
+
   /* Index into scene->geometry (only valid during update) */
   size_t index;
 
@@ -184,6 +193,10 @@ class Geometry : public Node {
   virtual bool has_motion_blur() const;
   bool has_voxel_attributes() const;
 
+  /* Whether any shader on this geometry samples emission, i.e. whether it puts emitters into the
+   * light tree at all. */
+  bool has_emission_shader() const;
+
   bool is_mesh() const
   {
     return geometry_type == MESH;
@@ -225,6 +238,41 @@ class GeometryManager {
    * on the stack, that becomes a dangling pointer. See #143662 for details. */
   TaskPool bvh_task_pool_;
 
+  /* Layout of the geometry data currently resident on the device, see scene/geometry_layout.h. */
+  DeviceGeometryLayout device_layout_;
+
+  /* Why the arrays could not keep their allocation on the last update, for diagnostics. */
+  const char *layout_reuse_rejected_reason_ = "not evaluated";
+
+  /* Raised when the interactive motion pass advanced the deformed positions and the device has not
+   * been told yet. Kept out of `update_flags` so it does not cascade into the object and light
+   * managers - see `update_interactive_motion`. */
+  bool motion_history_pending = false;
+
+  /* Motion blur mode the object bounds were last computed under. It decides how bounds are derived
+   * from the transform, so a change to it invalidates every object's bounds at once. */
+  bool bounds_used_motion_blur_ = false;
+
+  /* A non-emitting geometry was rebuilt, so the primitive offsets the light tree bakes into its
+   * emitters may have shifted underneath it. Whether they did is only known once
+   * `geom_calc_offset` has run, which is where this is answered and cleared. */
+  bool light_needs_offset_check_ = false;
+
+  /* Where each attribute entry landed in its table on the last upload, in packing order, one per
+   * physical table. An entry that did not change still has to be rewritten when it moved - see
+   * `AttributeTableEntry` in geometry_attributes.cpp. */
+  static const int ATTRIBUTE_TABLE_COUNT = 9;
+  vector<size_t> attribute_layouts_[ATTRIBUTE_TABLE_COUNT];
+
+  /* What the device already holds for `attributes_map`. It is a MEM_GLOBAL buffer, so uploading it
+   * waits on the tracing in flight, and it is rebuilt to identical bytes on almost every frame -
+   * see the comparison at the end of `update_svm_attributes`. */
+  vector<uint8_t> shadow_attributes_map_;
+
+  /* Whether the geometry arrays can keep their allocation: the layout matches what is resident, the
+   * arrays really are that size, and nothing else already required a reallocation. */
+  bool layout_can_reuse_allocation(Scene *scene, const DeviceGeometryLayout &layout);
+
  public:
   enum : uint32_t {
     UV_PASS_NEEDED = (1 << 0),
@@ -250,6 +298,11 @@ class GeometryManager {
 
     VOLUME_MODIFIED = (1 << 14),
 
+    /* The interactive motion pass advanced the deformed positions and nothing else changed. Only
+     * the attribute data moved, so this deliberately does not reach the object manager, does not
+     * rebuild the scene BVH and does not disturb the light tree. */
+    MOTION_HISTORY_MODIFIED = (1 << 15),
+
     /* tag everything in the manager for an update */
     UPDATE_ALL = ~0u,
 
@@ -265,15 +318,37 @@ class GeometryManager {
 
   void update_interactive_motion(Scene *scene);
 
+  /* True when the deformed positions advanced and the device still holds the previous frame's. */
+  bool need_motion_history_flush() const
+  {
+    return motion_history_pending;
+  }
+
+  /* Called by a rebuilt geometry that puts no emitter in the light tree: the tree only needs
+   * rebuilding if the primitive offsets moved, and that is not yet known at tagging time. */
+  void tag_light_needs_offset_check()
+  {
+    light_needs_offset_check_ = true;
+  }
+
   /* Device Updates */
   void device_update_preprocess(Device *device, Scene *scene, Progress &progress);
   void device_update(Device *device, DeviceScene *dscene, Scene *scene, Progress &progress);
   void device_free(Device *device, DeviceScene *dscene, bool force_free);
 
+  /* Compute the layout the scene would have, without writing to the geometries. */
+  static DeviceGeometryLayout compute_layout(Scene *scene);
+
   /* Updates */
   void tag_update(Scene *scene, const uint32_t flag);
 
   bool need_update() const;
+
+  /* Why the device arrays could not keep their allocation on the last update. Diagnostics only. */
+  const char *layout_reuse_rejected_reason() const
+  {
+    return layout_reuse_rejected_reason_;
+  }
 
   /* Statistics */
   void collect_statistics(const Scene *scene, RenderStats *stats);

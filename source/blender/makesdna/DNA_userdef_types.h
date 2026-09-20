@@ -532,6 +532,13 @@ enum eUserpref_RenderDisplayType : char {
   USER_RENDER_DISPLAY_WINDOW = 3
 };
 
+/** #UserDef.vsync_mode. On is zero, so a preferences file from before the field reads as On. */
+enum eUserpref_VSyncMode : char {
+  USER_VSYNC_ON = 0,
+  USER_VSYNC_OFF = 1,
+  USER_VSYNC_STRICT = 2,
+};
+
 enum eUserpref_TempSpaceDisplayType : char {
   USER_TEMP_SPACE_DISPLAY_FULLSCREEN = 0,
   USER_TEMP_SPACE_DISPLAY_WINDOW = 1,
@@ -1248,7 +1255,8 @@ struct UserDef {
   eUserpref_RenderDisplayType render_display_type = USER_RENDER_DISPLAY_WINDOW;
   eUserpref_TempSpaceDisplayType filebrowser_display_type = USER_TEMP_SPACE_DISPLAY_WINDOW;
   eUserpref_TempSpaceDisplayType preferences_display_type = USER_TEMP_SPACE_DISPLAY_WINDOW;
-  char _pad18[7] = {};
+  eUserpref_VSyncMode vsync_mode = USER_VSYNC_ON;
+  char _pad18[6] = {};
 
   eUserpref_SeqProxySetup sequencer_proxy_setup = USER_SEQ_PROXY_SETUP_AUTOMATIC;
   short _pad1 = {};

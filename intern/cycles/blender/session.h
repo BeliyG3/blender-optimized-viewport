@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <climits>
+
 #include "device/device.h"
 
 #include "scene/scene.h"
@@ -105,10 +107,33 @@ class BlenderSession {
   string b_rlay_name;
   string b_rview_name;
 
+  /* Offscreen capture - a viewport render or playblast reading this session's view back from an
+   * offscreen buffer. The capture waits for the engine to say the frame is there, and these are
+   * what saying so takes.
+   *
+   * `playblast_synced_frame_` is the scene frame whose data actually reached the session, which
+   * is not the frame Blender is on: `synchronize()` is allowed to refuse, and then the completion
+   * in hand belongs to an older frame. `playblast_mode_` is the switch: 0 waits for the first
+   * result after the sync - one accumulation through the reconstruction, the picture the viewport
+   * shows while the camera moves; 1 waits for the accumulation to finish, the picture it shows
+   * once the camera stops. */
+  int playblast_synced_frame_ = INT_MIN;
+  int playblast_mode_ = 0;
+
+
+  /* Whether waiting for this session is meaningful right now. False removes the wait entirely,
+   * and every condition in it is a way the engine could fail to report completion - the failure
+   * mode has to be "no wait", never "stuck". */
+  bool playblast_participates() const;
+
   string last_status;
   string last_error;
   double last_progress;
   double last_status_time;
+
+  /* Whether to report the viewport delivery rate in the status line. Read from the scene on the
+   * main thread, since the status is also built from the render thread. */
+  bool show_viewport_fps = false;
 
   int width, height;
   float pixelsize;
@@ -133,7 +158,7 @@ class BlenderSession {
   static bool print_render_stats;
 
  protected:
-  void stamp_view_layer_metadata(Scene *scene, const string &view_layer_name);
+  void stamp_view_layer_metadata(Scene *scene, const string &view_layer_name, bool dlss_requested);
 
   /* Check whether session error happened.
    * If so, it is reported to the render engine and true is returned.
@@ -149,6 +174,18 @@ class BlenderSession {
   void free_blender_memory_if_possible();
 
   void ensure_display_driver_if_needed();
+  void update_frame_generation_state();
+
+  bool use_dlss_animation_persistence() const;
+  bool dlss_history_needs_reset(const BufferParams &buffer_params,
+                                const string &layer,
+                                const string &view) const;
+  void dlss_history_commit(const BufferParams &buffer_params,
+                           const string &layer,
+                           const string &view);
+  bool has_dlss_reset_marker() const;
+  bool dlss_runtime_failed_ = false;
+  bool dlss_animation_persistence_active_ = false;
 
   struct {
     thread_mutex mutex;
@@ -158,9 +195,40 @@ class BlenderSession {
   /* NOTE: The BlenderSession references the display driver. */
   BlenderDisplayDriver *display_driver_ = nullptr;
 
+  struct {
+    bool valid = false;
+    bool enabled = false;
+    int frame = 0;
+    blender::Object *camera = nullptr;
+    float persmat[4][4] = {};
+    float persinv[4][4] = {};
+    string view_transform;
+    string look;
+    float exposure = 0.0f;
+    float gamma = 1.0f;
+  } frame_generation_history_;
+
   vector<string> full_buffer_files_;
 
   int bake_id = 0;
+
+  struct {
+    bool valid = false;
+    int frame = 0;
+    blender::Object *camera = nullptr;
+    string layer;
+    string view;
+    int width = 0;
+    int height = 0;
+    int full_x = 0;
+    int full_y = 0;
+    int window_x = 0;
+    int window_y = 0;
+    int window_width = 0;
+    int window_height = 0;
+    float upscale_factor = 0.0f;
+    string device_id;
+  } dlss_history_;
 };
 
 CCL_NAMESPACE_END

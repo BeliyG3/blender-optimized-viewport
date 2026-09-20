@@ -210,6 +210,21 @@ static const EnumPropertyItem rna_enum_preference_gpu_backend_items[] = {
     {GPU_BACKEND_VULKAN, "VULKAN", 0, "Vulkan", "Use Vulkan backend"},
     {0, nullptr, 0, nullptr, nullptr},
 };
+static const EnumPropertyItem rna_enum_preference_vsync_items[] = {
+    {USER_VSYNC_ON,
+     "ON",
+     0,
+     "On",
+     "Present frames in step with the display; a frame still waiting when a newer one is ready is "
+     "replaced by it"},
+    {USER_VSYNC_OFF, "OFF", 0, "Off", "Present frames as soon as they are ready, which can tear"},
+    {USER_VSYNC_STRICT,
+     "STRICT",
+     0,
+     "Strict",
+     "Present every frame in refresh order, capped at the display's refresh rate (Vulkan only)"},
+    {0, nullptr, 0, nullptr, nullptr},
+};
 static const EnumPropertyItem rna_enum_preference_gpu_preferred_device_items[] = {
     {0, "AUTO", 0, "Auto", "Auto detect best GPU for running Blender"},
     RNA_ENUM_ITEM_SEPR,
@@ -373,6 +388,12 @@ static void rna_userdef_gpu_update(Main * /*bmain*/, Scene * /*scene*/, PointerR
 
   WM_main_add_notifier(NC_WINDOW, nullptr);             /* full redraw */
   WM_main_add_notifier(NC_SCREEN | NA_EDITED, nullptr); /* refresh region sizes */
+  USERDEF_TAG_DIRTY;
+}
+
+static void rna_userdef_vsync_update(Main *bmain, Scene * /*scene*/, PointerRNA * /*ptr*/)
+{
+  WM_windows_vsync_update(static_cast<wmWindowManager *>(bmain->wm.first));
   USERDEF_TAG_DIRTY;
 }
 
@@ -6332,6 +6353,15 @@ static void rna_def_userdef_system(BlenderRNA *brna)
       prop,
       "GPU Backend",
       "GPU backend to use (requires restarting Blender for changes to take effect)");
+
+  prop = RNA_def_property(srna, "vsync", PROP_ENUM, PROP_NONE);
+  RNA_def_property_enum_sdna(prop, nullptr, "vsync_mode");
+  RNA_def_property_enum_items(prop, rna_enum_preference_vsync_items);
+  RNA_def_property_ui_text(prop,
+                           "VSync",
+                           "How frames are presented to the display. Takes effect at once on "
+                           "Vulkan; a --gpu-vsync command line option overrides it");
+  RNA_def_property_update(prop, 0, "rna_userdef_vsync_update");
 
   prop = RNA_def_property(srna, "gpu_preferred_device", PROP_ENUM, PROP_NONE);
   RNA_def_property_enum_items(prop, rna_enum_preference_gpu_preferred_device_items);

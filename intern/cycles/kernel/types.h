@@ -428,6 +428,7 @@ enum PassType {
   PASS_DENOISING_ROUGHNESS,
   PASS_DENOISING_DEPTH,
   PASS_DENOISING_BACKWARD_MOTION,
+  PASS_DENOISING_SPECULAR_MOTION,
   PASS_CATEGORY_DENOISING_END = 95,
 
   PASS_BAKE_PRIMITIVE,
@@ -461,7 +462,91 @@ enum DenoisingPassFlag {
   DENOISING_PASS_FOLLOW_REFLECTIONS = (1 << 0),
   /* Whether to use roughness-based weighting for the albedo or split by the BSDF type. */
   DENOISING_PASS_USE_ALBEDO_ROUGHNESS_WEIGHTING = (1 << 1),
+  /* Whether a volume scatter event writes its own depth and motion vector. Only the temporal
+   * reconstruction wants this; it would otherwise put fog motion into the user's Vector pass. */
+  DENOISING_PASS_VOLUME_MOTION = (1 << 2),
+  /* Whether the volume writes that vector on every primary segment rather than only when the
+   * sample scattered. Writing it only on scatter makes the vector a coin toss for a pixel with
+   * geometry behind the medium: one branch hands reconstruction the parallax of the medium's
+   * entry point, the other the parallax of the surface. Writing it always turns that into a
+   * blend of the two - still not deterministic, since a scattered path never reaches the
+   * surface, but the swing is halved. */
+  DENOISING_PASS_VOLUME_MOTION_ALWAYS = (1 << 3),
+  /* Whether the volume writes its vector only on a segment that ends in the background. Blending
+   * the medium's vector with the surface's does not help - the medium's share of a dense fog is
+   * near one, so any weighting still hands reconstruction the wrong parallax for a pixel that
+   * shows an object. Withholding the write where a surface follows lets that surface describe the
+   * pixel, while a pixel that is nothing but fog still gets the entry point it needs. */
+  DENOISING_PASS_VOLUME_MOTION_BACKGROUND_ONLY = (1 << 4),
+  /* Whether the volume withholds its vector when the segment ends on a surface that is not the
+   * medium's own hull. Testing for the background alone is not enough: the medium is a mesh, so a
+   * segment almost always ends on its own back face and the test never fires. Comparing the object
+   * instead lets fog describe a pixel that is only fog, and lets an object inside or behind the
+   * fog describe itself - it writes its own vector when the path reaches it. */
+  DENOISING_PASS_VOLUME_MOTION_OWN_MEDIUM_ONLY = (1 << 5),
+  /* Whether a scattered sample describes the pixel with the parallax of whatever ends the segment
+   * rather than of the medium's entry point. Withholding the write instead - what
+   * `..._OWN_MEDIUM_ONLY` does - leaves the weight at zero whenever the sample scatters, because a
+   * scattered path never reaches the surface to write its own vector either, and a zero vector
+   * tells reconstruction the pixel did not move. Measured: the lava lagged 0.9 of a camera step
+   * behind, the tank 0.31, which is the ghosting. The end point is known even on a scattered
+   * sample: the intersection is found before the scatter is drawn. */
+  DENOISING_PASS_VOLUME_MOTION_SEGMENT_END = (1 << 6),
+  /* Whether the depth describes the same point the motion vector was built from.
+   *
+   * Nothing writes depth on a scattering event: the only depth a fogged pixel carries comes from
+   * the medium's bounding surface, which is its front face. With `..._SEGMENT_END` the vector
+   * moved to the end of the segment while the depth stayed at that front face, so the two describe
+   * different places - and NVIDIA's integration guide asks for the depth the vector was made from.
+   * Reconstruction then reprojects history by the parallax of the object, fails to confirm it
+   * against the depth of the fog wall, and falls back on the current noisy frame.
+   *
+   * The depth pass accumulates deltas (`denoising_depth_compute` writes the difference between two
+   * vertices, `film_write_pass_float` adds), so writing the delta from the entry point to the end
+   * of the segment makes a scattered sample land on exactly the number a transmitted one reaches
+   * through the surface. The guide stops depending on how the scatter was drawn. */
+  DENOISING_PASS_VOLUME_DEPTH_SEGMENT_END = (1 << 7),
+  /* Whether the medium describes the pixel by itself, with a point that does not depend on how the
+   * scatter was drawn, and everything the path reaches afterwards leaves the depth alone.
+   *
+   * `..._DEPTH_SEGMENT_END` only agrees where the segment ends on a foreign object. Where it ends
+   * on the medium's own back face - which is most of a fog cube - a scattered sample stops there
+   * while a transmitted one carries on to whatever is behind, so the two still describe different
+   * places, and measured that left half the frame changing depth every iteration.
+   *
+   * Nothing can be known about what lies past the back face without tracing another ray. What can
+   * be known is where this segment's light comes from: the mean distance of a first scattering
+   * event, given that one happened. That point is a function of the segment and its optical depth,
+   * not of the random draw, so both branches land on it - and it is where the eye reads the fog as
+   * being, one mean free path in, rather than on the front face several units nearer. The motion
+   * vector is built from the same point, so the two agree.
+   *
+   * A segment that ends on a foreign object still uses that object: it is what the pixel shows. */
+  DENOISING_PASS_VOLUME_DEPTH_REPRESENTATIVE = (1 << 8),
+  /* Whether a scattered sample gives the normal of the surface that ends its segment instead of
+   * claiming the pixel faces the camera.
+   *
+   * A scattering event has no surface, so the volume writes `(0,0,-1)` and full roughness - a
+   * reasonable description of a phase function, and the only thing available when the pixel really
+   * is nothing but fog. Where an object ends the segment it is wrong, and in a medium this dense it
+   * is wrong in 94% of the samples that show that object.
+   *
+   * Measured how much each guide is worth to the network by replacing it with a constant: depth
+   * moved the frame 1.15x the spread between two identical runs, diffuse albedo 0.98x - nothing -
+   * and normal-with-roughness 2.02x. Of the four it is the one being read, and it is the one this
+   * scene has been feeding a constant to all along.
+   *
+   * The intersection is known before the scatter is drawn, so the geometric normal costs three
+   * vertex fetches and no ray. */
+  DENOISING_PASS_VOLUME_SURFACE_NORMAL = (1 << 9),
 };
+
+/* What the denoising depth carries where nothing is in front of the background.
+ *
+ * `FLT_MAX` is not a depth a network can subtract or interpolate, and a pixel that alternates
+ * between it and a real depth reads as geometry appearing and vanishing. This is far past anything
+ * in a scene of this scale and still survives being stored at half precision. */
+#define VOLUME_DENOISING_FAR_DEPTH 1e4f
 
 /* Closure Filter */
 
@@ -571,6 +656,34 @@ enum DirectLightSamplingType {
   DIRECT_LIGHT_SAMPLING_NEE = 2,
 
   DIRECT_LIGHT_SAMPLING_NUM,
+};
+
+/* Corrections to the froxel grid's lighting, switched on one at a time.
+ *
+ * The grid trades accuracy for a picture that holds still, and each of these buys some of that
+ * accuracy back. They are separate bits rather than one switch because the point is to measure
+ * what each one is worth against the traced result - a single flag would only say whether the set
+ * of them is better, which is not the question. */
+enum VolumeFroxelFix {
+  /* Light an emitter whose emission is not a constant, using the average the light tree already
+   * keeps for it, instead of contributing nothing at all. */
+  VOLUME_FROXEL_FIX_EMITTER_ESTIMATE = (1 << 0),
+  /* A light the medium does not reach shines undimmed, rather than through the whole distance to
+   * it - which for a distant light is infinite and leaves the cell black. */
+  VOLUME_FROXEL_FIX_UNBOUNDED_SHADOW = (1 << 1),
+  /* Take the optical depth towards the light by walking the density octree, instead of assuming
+   * the medium fills its hull at the density found at the cell. */
+  VOLUME_FROXEL_FIX_MARCHED_SHADOW = (1 << 2),
+  /* Weigh a slice by how much of it the medium actually covers, instead of asking whether the
+   * midpoint happens to land inside. */
+  VOLUME_FROXEL_FIX_SLICE_OVERLAP = (1 << 3),
+  /* Let a world volume, which has no hull to be found by, fill the column. */
+  VOLUME_FROXEL_FIX_WORLD_VOLUME = (1 << 4),
+  /* Stand in for the light that scatters more than once, which the grid otherwise drops. */
+  VOLUME_FROXEL_FIX_MULTI_SCATTER = (1 << 5),
+  /* Let the light through the boundary of the medium itself, which a shadow trace that stops at
+   * the first thing it meets treats as a wall. */
+  VOLUME_FROXEL_FIX_HULL_SHADOW = (1 << 6),
 };
 
 /* Differential */
@@ -1807,13 +1920,18 @@ enum DeviceKernel : int {
   DEVICE_KERNEL_ADAPTIVE_SAMPLING_CONVERGENCE_FILTER_Y,
 
   DEVICE_KERNEL_FILTER_GUIDING_PREPROCESS,
+  DEVICE_KERNEL_FILTER_GUIDING_PREPROCESS_TO_SURFACE,
   DEVICE_KERNEL_FILTER_GUIDING_SET_FAKE_ALBEDO,
   DEVICE_KERNEL_FILTER_COLOR_PREPROCESS,
+  DEVICE_KERNEL_FILTER_COLOR_PREPROCESS_TO_SURFACE,
   DEVICE_KERNEL_FILTER_COLOR_POSTPROCESS,
+  DEVICE_KERNEL_FILTER_COLOR_POSTPROCESS_FROM_SURFACE,
   DEVICE_KERNEL_FILTER_COLOR_FLIP_Y,
 
   DEVICE_KERNEL_VOLUME_GUIDING_FILTER_X,
   DEVICE_KERNEL_VOLUME_GUIDING_FILTER_Y,
+
+  DEVICE_KERNEL_VOLUME_FROXEL_INJECT,
 
   DEVICE_KERNEL_CRYPTOMATTE_POSTPROCESS,
 

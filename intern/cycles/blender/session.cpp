@@ -2,12 +2,23 @@
  *
  * SPDX-License-Identifier: Apache-2.0 */
 
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
+#include "BLI_listbase.h"
+#include "BLI_math_matrix.h"
 #include "DEG_depsgraph_query.hh"
+#include "DNA_scene_types.h"
 #include "DNA_screen_types.h"
 #include "DNA_space_types.h"
 #include "RNA_prototypes.hh"
+
+#include "GPU_frame_generation.hh"
+#include "IMB_colormanagement.hh"
 
 #include "device/device.h"
 
@@ -44,6 +55,191 @@ CCL_NAMESPACE_BEGIN
 DeviceTypeMask BlenderSession::device_override = DEVICE_MASK_ALL;
 bool BlenderSession::headless = false;
 bool BlenderSession::print_render_stats = false;
+
+static bool get_show_viewport_fps(blender::Scene &b_scene)
+{
+  blender::PointerRNA scene_rna_ptr = RNA_id_pointer_create(&b_scene.id);
+  blender::PointerRNA cscene = RNA_pointer_get(&scene_rna_ptr, "cycles");
+  return get_boolean(cscene, "use_dlss_viewport_fps");
+}
+
+void BlenderSession::update_frame_generation_state()
+{
+  if (display_driver_ == nullptr || b_scene == nullptr || b_rv3d == nullptr || b_v3d == nullptr) {
+    return;
+  }
+
+  blender::PointerRNA scene_rna_ptr = RNA_id_pointer_create(&b_scene->id);
+  blender::PointerRNA cscene = RNA_pointer_get(&scene_rna_ptr, "cycles");
+  const bool hdr_output = IMB_colormanagement_display_is_hdr(
+      &b_scene->display_settings, b_scene->view_settings.view_transform);
+  const bool enabled = get_boolean(cscene, "use_preview_denoising") &&
+                       get_boolean(cscene, "use_dlss_preview") &&
+                       get_boolean(cscene, "use_dlss_frame_generation") && !hdr_output;
+  display_driver_->set_frame_generation_enabled(enabled);
+  if (!enabled) {
+    frame_generation_history_.enabled = false;
+    return;
+  }
+
+  const blender::ColorManagedViewSettings &view_settings = b_scene->view_settings;
+  const bool color_management_changed = frame_generation_history_.valid &&
+                                        (frame_generation_history_.view_transform !=
+                                             view_settings.view_transform ||
+                                         frame_generation_history_.look != view_settings.look ||
+                                         frame_generation_history_.exposure !=
+                                             view_settings.exposure ||
+                                         frame_generation_history_.gamma != view_settings.gamma);
+  const bool view_changed = !frame_generation_history_.valid ||
+                            !blender::compare_m4m4(
+                                frame_generation_history_.persmat, b_rv3d->persmat, 1e-6f);
+  const bool output_frame_changed = !frame_generation_history_.valid ||
+                                    b_scene->r.cfra != frame_generation_history_.frame;
+  const bool camera_changed = !frame_generation_history_.valid ||
+                              b_scene->camera != frame_generation_history_.camera;
+  if (frame_generation_history_.enabled && !view_changed && !output_frame_changed &&
+      !camera_changed && !color_management_changed)
+  {
+    return;
+  }
+
+  const bool timeline_discontinuous = frame_generation_history_.valid &&
+                                      b_scene->r.cfra != frame_generation_history_.frame &&
+                                      b_scene->r.cfra != frame_generation_history_.frame + 1;
+  if (!frame_generation_history_.enabled || color_management_changed || timeline_discontinuous ||
+      camera_changed || has_dlss_reset_marker())
+  {
+    display_driver_->request_frame_generation_reset();
+  }
+
+  blender::gpu::FrameGenerationCamera camera;
+  float camera_view_to_clip[4][4];
+  blender::transpose_m4_m4(camera_view_to_clip, b_rv3d->winmat);
+  std::memcpy(camera.camera_view_to_clip, camera_view_to_clip, sizeof(camera.camera_view_to_clip));
+  float inverse_projection[4][4];
+  blender::invert_m4_m4(inverse_projection, b_rv3d->winmat);
+  float clip_to_camera_view[4][4];
+  blender::transpose_m4_m4(clip_to_camera_view, inverse_projection);
+  std::memcpy(camera.clip_to_camera_view, clip_to_camera_view, sizeof(camera.clip_to_camera_view));
+  blender::unit_m4(reinterpret_cast<float (*)[4]>(camera.clip_to_lens_clip));
+
+  if (frame_generation_history_.valid) {
+    float clip_to_previous[4][4];
+    float previous_to_clip[4][4];
+    blender::mul_m4_m4m4(clip_to_previous, frame_generation_history_.persmat, b_rv3d->persinv);
+    blender::mul_m4_m4m4(previous_to_clip, b_rv3d->persmat, frame_generation_history_.persinv);
+    float clip_to_previous_row_major[4][4];
+    float previous_to_clip_row_major[4][4];
+    blender::transpose_m4_m4(clip_to_previous_row_major, clip_to_previous);
+    blender::transpose_m4_m4(previous_to_clip_row_major, previous_to_clip);
+    std::memcpy(
+        camera.clip_to_prev_clip, clip_to_previous_row_major, sizeof(camera.clip_to_prev_clip));
+    std::memcpy(
+        camera.prev_clip_to_clip, previous_to_clip_row_major, sizeof(camera.prev_clip_to_clip));
+  }
+  else {
+    blender::unit_m4(reinterpret_cast<float (*)[4]>(camera.clip_to_prev_clip));
+    blender::unit_m4(reinterpret_cast<float (*)[4]>(camera.prev_clip_to_clip));
+  }
+
+  for (int axis = 0; axis < 3; axis++) {
+    camera.position[axis] = b_rv3d->viewinv[3][axis];
+    camera.right[axis] = b_rv3d->viewinv[0][axis];
+    camera.up[axis] = b_rv3d->viewinv[1][axis];
+    camera.forward[axis] = -b_rv3d->viewinv[2][axis];
+  }
+  camera.near_clip = b_v3d->clip_start;
+  camera.far_clip = b_v3d->clip_end;
+  camera.orthographic = b_rv3d->is_persp == 0;
+  camera.field_of_view = 2.0f * std::atan(1.0f / std::max(fabsf(b_rv3d->winmat[1][1]), 1e-8f));
+  camera.aspect_ratio = fabsf(b_rv3d->winmat[1][1] / b_rv3d->winmat[0][0]);
+  display_driver_->set_frame_generation_camera(camera);
+
+  frame_generation_history_.valid = true;
+  frame_generation_history_.enabled = true;
+  frame_generation_history_.frame = b_scene->r.cfra;
+  frame_generation_history_.camera = b_scene->camera;
+  std::memcpy(frame_generation_history_.persmat,
+              b_rv3d->persmat,
+              sizeof(frame_generation_history_.persmat));
+  std::memcpy(frame_generation_history_.persinv,
+              b_rv3d->persinv,
+              sizeof(frame_generation_history_.persinv));
+  frame_generation_history_.view_transform = view_settings.view_transform;
+  frame_generation_history_.look = view_settings.look;
+  frame_generation_history_.exposure = view_settings.exposure;
+  frame_generation_history_.gamma = view_settings.gamma;
+}
+
+bool BlenderSession::use_dlss_animation_persistence() const
+{
+  if (!background || (b_engine.flag & blender::RE_ENGINE_FRAME_SEQUENCE) == 0 ||
+      b_scene == nullptr)
+  {
+    return false;
+  }
+
+  blender::PointerRNA scene_rna_ptr = RNA_id_pointer_create(&b_scene->id);
+  blender::PointerRNA cscene = RNA_pointer_get(&scene_rna_ptr, "cycles");
+  return RNA_boolean_get(&cscene, "use_denoising") && RNA_boolean_get(&cscene, "use_dlss_render");
+}
+
+bool BlenderSession::has_dlss_reset_marker() const
+{
+  if (b_scene == nullptr) {
+    return false;
+  }
+
+  for (const blender::TimeMarker &marker : b_scene->markers) {
+    if (marker.frame == b_scene->r.cfra && STREQ(marker.name, "DLSS_RESET")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool BlenderSession::dlss_history_needs_reset(const BufferParams &buffer_params,
+                                              const string &layer,
+                                              const string &view) const
+{
+  if (!dlss_history_.valid || has_dlss_reset_marker()) {
+    return true;
+  }
+
+  return b_scene->r.cfra != dlss_history_.frame + 1 || b_scene->camera != dlss_history_.camera ||
+         layer != dlss_history_.layer || view != dlss_history_.view ||
+         buffer_params.width != dlss_history_.width ||
+         buffer_params.height != dlss_history_.height ||
+         buffer_params.full_x != dlss_history_.full_x ||
+         buffer_params.full_y != dlss_history_.full_y ||
+         buffer_params.window_x != dlss_history_.window_x ||
+         buffer_params.window_y != dlss_history_.window_y ||
+         buffer_params.window_width != dlss_history_.window_width ||
+         buffer_params.window_height != dlss_history_.window_height ||
+         scene->integrator->get_denoiser_upscale_factor() != dlss_history_.upscale_factor ||
+         session->params.device.id != dlss_history_.device_id;
+}
+
+void BlenderSession::dlss_history_commit(const BufferParams &buffer_params,
+                                         const string &layer,
+                                         const string &view)
+{
+  dlss_history_.valid = true;
+  dlss_history_.frame = b_scene->r.cfra;
+  dlss_history_.camera = b_scene->camera;
+  dlss_history_.layer = layer;
+  dlss_history_.view = view;
+  dlss_history_.width = buffer_params.width;
+  dlss_history_.height = buffer_params.height;
+  dlss_history_.full_x = buffer_params.full_x;
+  dlss_history_.full_y = buffer_params.full_y;
+  dlss_history_.window_x = buffer_params.window_x;
+  dlss_history_.window_y = buffer_params.window_y;
+  dlss_history_.window_width = buffer_params.window_width;
+  dlss_history_.window_height = buffer_params.window_height;
+  dlss_history_.upscale_factor = scene->integrator->get_denoiser_upscale_factor();
+  dlss_history_.device_id = session->params.device.id;
+}
 
 BlenderSession::BlenderSession(blender::RenderEngine &b_engine,
                                blender::UserDef &b_userpref,
@@ -118,8 +314,14 @@ BlenderSession::~BlenderSession()
 
 void BlenderSession::create_session()
 {
-  const SessionParams session_params = BlenderSync::get_session_params(
+  SessionParams session_params = BlenderSync::get_session_params(
       b_engine, b_userpref, *b_scene, background, pixelsize);
+  if (use_dlss_animation_persistence()) {
+    /* Offline DLSS disables tiling so every temporal input covers the whole frame. Keep the
+     * reset-session parameters consistent with render(), otherwise the auto-tile difference
+     * recreates the Session and NGX feature between animation frames. */
+    session_params.use_auto_tile = false;
+  }
   const SceneParams scene_params = BlenderSync::get_scene_params(
       b_userpref, *b_data, *b_scene, background, use_developer_ui);
   const bool session_pause = BlenderSync::get_session_pause(*b_scene, background);
@@ -139,6 +341,14 @@ void BlenderSession::create_session()
   /* create scene */
   scene = session->scene.get();
   scene->name = BKE_id_name(b_scene->id);
+
+  /* Per-manager scene update timings are otherwise only available for final renders, which never
+   * take the interactive motion pass, so viewport update cost cannot be attributed at all. Behind
+   * an environment variable because the report is printed on every `Scene::device_update` and would
+   * flood a playback log. */
+  if (!background && getenv("CYCLES_DEBUG_VIEWPORT_UPDATE_STATS")) {
+    scene->enable_update_stats();
+  }
 
   /* create sync */
   sync = make_unique<BlenderSync>(
@@ -205,13 +415,19 @@ void BlenderSession::reset_session(blender::Main &b_data, blender::Depsgraph &b_
     return;
   }
 
-  const SessionParams session_params = BlenderSync::get_session_params(
+  SessionParams session_params = BlenderSync::get_session_params(
       b_engine, b_userpref, *b_scene, background, pixelsize);
+  if (use_dlss_animation_persistence()) {
+    session_params.use_auto_tile = false;
+  }
   const SceneParams scene_params = BlenderSync::get_scene_params(
       b_userpref, b_data, *b_scene, background, use_developer_ui);
 
+  const bool effective_persistent_data = (this->b_render->mode & blender::R_PERSISTENT_DATA) !=
+                                             0 ||
+                                         use_dlss_animation_persistence();
   if (scene->params.modified(scene_params) || session->params.modified(session_params) ||
-      (this->b_render->mode & blender::R_PERSISTENT_DATA) == 0)
+      !effective_persistent_data)
   {
     /* if scene or session parameters changed, it's easier to simply re-create
      * them rather than trying to distinguish which settings need to be updated
@@ -263,6 +479,10 @@ void BlenderSession::free_session()
 
   sync.reset();
   session.reset();
+  dlss_history_.valid = false;
+  dlss_runtime_failed_ = false;
+  dlss_animation_persistence_active_ = false;
+  frame_generation_history_ = {};
 
   display_driver_ = nullptr;
 }
@@ -284,7 +504,9 @@ static void add_cryptomatte_layer(blender::RenderResult &b_rr, string name, stri
   render_add_metadata(b_rr, prefix + "manifest", manifest);
 }
 
-void BlenderSession::stamp_view_layer_metadata(Scene *scene, const string &view_layer_name)
+void BlenderSession::stamp_view_layer_metadata(Scene *scene,
+                                               const string &view_layer_name,
+                                               const bool dlss_requested)
 {
   blender::RenderResult *b_rr = RE_engine_get_result(&b_engine);
   const string prefix = "cycles." + view_layer_name + ".";
@@ -292,6 +514,25 @@ void BlenderSession::stamp_view_layer_metadata(Scene *scene, const string &view_
   /* Configured number of samples for the view layer. */
   BKE_render_result_stamp_data(
       b_rr, (prefix + "samples").c_str(), to_string(session->params.samples).c_str());
+
+  const bool dlss_effective = scene->integrator->get_use_denoise() &&
+                              scene->integrator->get_denoiser_type() == DENOISER_DLSS;
+  BKE_render_result_stamp_data(
+      b_rr, (prefix + "dlss_requested").c_str(), dlss_requested ? "true" : "false");
+  const char *effective_denoiser = dlss_effective                        ? "DLSS" :
+                                   !scene->integrator->get_use_denoise() ? "Disabled" :
+                                   scene->integrator->get_denoiser_type() == DENOISER_OPTIX ?
+                                                                           "OptiX" :
+                                                                           "Other";
+  BKE_render_result_stamp_data(b_rr, (prefix + "dlss_effective").c_str(), effective_denoiser);
+  if (dlss_requested && !dlss_effective) {
+    const char *reason = !scene->integrator->get_use_denoise() ?
+                             "Denoising disabled for this View Layer" :
+                         scene->film->get_cryptomatte_passes() != CRYPT_NONE ?
+                             "Cryptomatte requires full-resolution unfiltered passes" :
+                             "DLSS unavailable on the selected device, driver, or runtime";
+    BKE_render_result_stamp_data(b_rr, (prefix + "dlss_fallback_reason").c_str(), reason);
+  }
 
   /* Store ranged samples information. */
   /* TODO(sergey): Need to bring this information back. */
@@ -375,6 +616,10 @@ void BlenderSession::render(blender::Depsgraph &b_depsgraph_)
   sync->sync_render_passes(*b_rlay, b_view_layer);
 
   const int num_views = b_rr->views.count();
+  blender::PointerRNA scene_rna_ptr = RNA_id_pointer_create(&b_scene->id);
+  blender::PointerRNA cscene = RNA_pointer_get(&scene_rna_ptr, "cycles");
+  const bool dlss_requested = RNA_boolean_get(&cscene, "use_dlss_render");
+  dlss_animation_persistence_active_ = false;
 
   for (const auto [view_index, b_view] : b_rr->views.enumerate()) {
     b_rview_name = b_view.name;
@@ -404,6 +649,18 @@ void BlenderSession::render(blender::Depsgraph &b_depsgraph_)
                     &python_thread_state,
                     session_params.denoise_device);
 
+    const bool offline_dlss = scene->integrator->get_use_denoise() &&
+                              scene->integrator->get_denoiser_type() == DENOISER_DLSS &&
+                              scene->integrator->get_dlss_offline();
+    dlss_animation_persistence_active_ |= offline_dlss &&
+                                          (b_engine.flag & blender::RE_ENGINE_FRAME_SEQUENCE) != 0;
+    if (dlss_animation_persistence_active_) {
+      b_engine.flag |= blender::RE_ENGINE_FORCE_PERSISTENT_DATA;
+    }
+    else {
+      b_engine.flag &= ~blender::RE_ENGINE_FORCE_PERSISTENT_DATA;
+    }
+
     /* At the moment we only free if we are not doing multi-view
      * (or if we are rendering the last view). See #58142/D4239 for discussion.
      */
@@ -417,7 +674,7 @@ void BlenderSession::render(blender::Depsgraph &b_depsgraph_)
     /* Attempt to free all data which is held by Blender side, since at this
      * point we know that we've got everything to render current view layer.
      */
-    if (can_free_cache) {
+    if (can_free_cache && !offline_dlss) {
       free_blender_memory_if_possible();
     }
 
@@ -430,6 +687,14 @@ void BlenderSession::render(blender::Depsgraph &b_depsgraph_)
       scene->integrator->set_seed(seed);
     }
 
+    if (dlss_runtime_failed_ && scene->integrator->get_denoiser_type() == DENOISER_DLSS) {
+      scene->integrator->set_denoiser_type(DENOISER_OPTIX);
+      scene->integrator->set_denoiser_upscale_factor(1.0f);
+      scene->integrator->set_dlss_offline(false);
+      LOG_WARNING << "DLSS disabled for the remainder of this render session after a runtime "
+                     "failure. Using OptiX.";
+    }
+
     /* Update number of samples per layer. */
     const int samples = sync->get_layer_samples();
     const bool bound_samples = sync->get_layer_bound_samples();
@@ -439,8 +704,33 @@ void BlenderSession::render(blender::Depsgraph &b_depsgraph_)
       effective_session_params.samples = samples;
     }
 
+    /* Every independent DLSS input must cover the entire frame before the next temporal
+     *
+     * iteration. Keep normal auto-tiling when DLSS was requested but fell back to OptiX. */
+    effective_session_params.use_auto_tile = !offline_dlss;
+
     /* Update session itself. */
     session->reset(effective_session_params, buffer_params);
+
+    bool commit_dlss_history = false;
+    if (offline_dlss) {
+      blender::PointerRNA scene_rna_ptr = RNA_id_pointer_create(&b_scene->id);
+      blender::PointerRNA cscene = RNA_pointer_get(&scene_rna_ptr, "cycles");
+
+      const bool animation = (b_engine.flag & blender::RE_ENGINE_FRAME_SEQUENCE) != 0;
+      const bool reset_history = !animation || dlss_history_needs_reset(
+                                                   buffer_params, b_rlay_name, b_rview_name);
+      const int iterations = animation ? (reset_history ?
+                                              RNA_int_get(&cscene, "dlss_reset_iterations") :
+                                              RNA_int_get(&cscene, "dlss_animation_iterations")) :
+                                         RNA_int_get(&cscene, "dlss_still_iterations");
+
+      scene->integrator->set_dlss_animation(animation);
+      scene->integrator->set_dlss_reset_history(reset_history);
+      scene->integrator->set_dlss_zero_motion_first(!animation || reset_history);
+      scene->integrator->set_dlss_iterations(max(iterations, 1));
+      commit_dlss_history = animation;
+    }
 
     /* render */
     if ((b_engine.flag & blender::RE_ENGINE_PREVIEW) == 0 && background && print_render_stats) {
@@ -449,6 +739,40 @@ void BlenderSession::render(blender::Depsgraph &b_depsgraph_)
 
     session->start();
     session->wait();
+
+    if (offline_dlss && session->dlss_runtime_failed()) {
+      dlss_runtime_failed_ = true;
+      dlss_history_.valid = false;
+      commit_dlss_history = false;
+      dlss_animation_persistence_active_ = false;
+      b_engine.flag &= ~blender::RE_ENGINE_FORCE_PERSISTENT_DATA;
+
+      LOG_WARNING << "DLSS runtime evaluation failed. Restarting this frame at full resolution "
+                     "with OptiX.";
+      scene->integrator->set_denoiser_type(DENOISER_OPTIX);
+      scene->integrator->set_denoiser_upscale_factor(1.0f);
+      scene->integrator->set_dlss_offline(false);
+      scene->integrator->set_dlss_animation(false);
+      scene->integrator->set_dlss_reset_history(true);
+      scene->integrator->set_dlss_zero_motion_first(true);
+      scene->integrator->set_dlss_iterations(1);
+
+      SessionParams fallback_session_params = effective_session_params;
+      fallback_session_params.use_auto_tile = true;
+      session->progress.reset();
+      session->reset(fallback_session_params, buffer_params);
+      session->start();
+      session->wait();
+    }
+
+    if (commit_dlss_history) {
+      if (session->progress.get_cancel() || session->progress.get_error()) {
+        dlss_history_.valid = false;
+      }
+      else {
+        dlss_history_commit(buffer_params, b_rlay_name, b_rview_name);
+      }
+    }
 
     if ((b_engine.flag & blender::RE_ENGINE_PREVIEW) == 0 && background && print_render_stats) {
       RenderStats stats;
@@ -462,7 +786,7 @@ void BlenderSession::render(blender::Depsgraph &b_depsgraph_)
   }
 
   /* add metadata */
-  stamp_view_layer_metadata(scene, b_rlay_name);
+  stamp_view_layer_metadata(scene, b_rlay_name, dlss_requested);
 
   /* free result without merging */
   RE_engine_end_result(&b_engine, b_rr, true, false, false);
@@ -475,6 +799,11 @@ void BlenderSession::render(blender::Depsgraph &b_depsgraph_)
   double total_time;
   double render_time;
   session->progress.get_time(total_time, render_time);
+  if (print_render_stats) {
+    printf("CYCLES_RENDER_CORE_SECONDS=%.9f\n", render_time);
+    printf("CYCLES_RENDER_EFFECTIVE_DENOISER=%s\n",
+           scene->integrator->get_denoiser_type() == DENOISER_DLSS ? "DLSS" : "OPTIX_OR_OTHER");
+  }
   LOG_INFO << "Total render time: " << total_time;
   LOG_INFO << "Render time (without synchronization): " << render_time;
 }
@@ -486,7 +815,9 @@ void BlenderSession::render_frame_finish()
   b_rlay_name = "";
   b_rview_name = "";
 
-  if ((b_render->mode & blender::R_PERSISTENT_DATA) == 0) {
+  const bool effective_persistent_data = (b_render->mode & blender::R_PERSISTENT_DATA) != 0 ||
+                                         dlss_animation_persistence_active_;
+  if (!effective_persistent_data) {
     /* Free the sync object so that it can properly dereference nodes from the scene graph before
      * the graph is freed. */
     sync.reset();
@@ -778,6 +1109,28 @@ void BlenderSession::synchronize(blender::Depsgraph &b_depsgraph_)
     return;
   }
 
+  /* Splits the per-frame cost that sits outside `Scene::device_update`: how much of it is Cycles
+   * reading the evaluated scene back out of Blender, and how much is everything else. Wall-clock
+   * only, four numbers per frame - anything finer distorts what it measures. */
+  static const bool report_sync = getenv("CYCLES_DEBUG_VIEWPORT_PHASES") != nullptr;
+  const double sync_start_time = report_sync ? time_dt() : 0.0;
+  double recalc_ms = 0.0;
+  double sync_data_ms = 0.0;
+  bool sync_deferred = true;
+
+  const auto report_sync_timing = [&]() {
+    if (!report_sync) {
+      return;
+    }
+    fprintf(stderr,
+            "VIEWPORT_SYNC total=%.2f recalc=%.2f data=%.2f deferred=%d\n",
+            (time_dt() - sync_start_time) * 1000.0,
+            recalc_ms,
+            sync_data_ms,
+            int(sync_deferred));
+    fflush(stderr);
+  };
+
   /* on session/scene parameter changes, we recreate session entirely */
   const SessionParams session_params = BlenderSync::get_session_params(
       b_engine, b_userpref, *b_scene, background, pixelsize);
@@ -794,42 +1147,167 @@ void BlenderSession::synchronize(blender::Depsgraph &b_depsgraph_)
 
   /* increase samples and render time, but never decrease */
   session->set_samples(session_params.samples);
+  session->set_interactive_samples(session_params.interactive_samples);
   session->set_time_limit(session_params.time_limit);
   session->set_pause(session_pause);
 
+  /* The capture switch, read once per sync rather than on every redraw: `view_draw` runs several
+   * times per frame and an RNA lookup there would be pure overhead. An enum, so `get_enum` - an
+   * enum read with `get_int` comes back as its index and never reaches the code that wants it. */
+  {
+    blender::PointerRNA scene_rna_ptr = RNA_id_pointer_create(&b_scene->id);
+    blender::PointerRNA cscene = RNA_pointer_get(&scene_rna_ptr, "cycles");
+    playblast_mode_ = get_enum(cscene, "dlss_playblast_mode", 2, 0);
+  }
+
+  /* Second, independent source of the interaction state. `view_draw` is the primary one, but this
+   * runs on every depsgraph update and keeps the viewport from getting stuck on the reduced budget
+   * if a draw-side transition is ever missed.
+   *
+   * During an offscreen capture the state is the switch, not the mouse: the fast mode is the
+   * viewport playing back - moving, on the grid, one input per frame with the history carried
+   * across - and the converging one is the viewport once it has settled. */
+  const bool fast_capture = b_engine.viewport_offscreen_capture && (playblast_mode_ == 0);
+  session->set_interaction_state(b_engine.viewport_offscreen_capture ?
+                                     (playblast_mode_ == 0) :
+                                     viewport_interaction_active(b_screen, b_rv3d));
+  session->set_volume_grid_hold(fast_capture);
+
+  /* The fast capture reads the first input of each frame, and nothing rendered after it reaches
+   * the frame - so a budget of one: the render thread is idle by the time the capture has read
+   * the frame, the next frame's reset has nothing to cancel and wait for, and the GPU is free for
+   * the next frame's input rather than for accumulation no one will see. */
+  if (fast_capture) {
+    session->set_interactive_samples(1);
+  }
+
+  show_viewport_fps = get_show_viewport_fps(*b_scene);
+
   /* copy recalc flags, outside of mutex so we can decide to do the real
    * synchronization at a later time to not block on running updates */
-  sync->sync_recalc(b_depsgraph_, b_screen, b_v3d, b_rv3d);
+  {
+    const double recalc_start_time = report_sync ? time_dt() : 0.0;
+    sync->sync_recalc(b_depsgraph_, b_screen, b_v3d, b_rv3d);
+    recalc_ms = report_sync ? (time_dt() - recalc_start_time) * 1000.0 : 0.0;
+  }
 
   /* don't do synchronization if on pause */
   if (session_pause) {
     tag_update();
+    report_sync_timing();
     return;
   }
 
   /* try to acquire mutex. if we don't want to or can't, come back later */
-  if (!session->ready_to_reset() || !session->scene->mutex.try_lock()) {
-    tag_update();
-    return;
+  {
+    /* Which of the two refusals dominates decides whether shortening the sync pays off at all.
+     * `!ready_to_reset` means the previous result has not been drawn yet - the loop is bounded by
+     * the render thread, and a faster sync only waits longer. `!try_lock` means the scene is held,
+     * and there every millisecond taken off the sync is a millisecond the next one starts earlier.
+     * The two were indistinguishable in the counters, so half the deferred frames were being read
+     * as contention that may not exist. */
+    const bool not_ready = !session->ready_to_reset();
+
+    /* Waited on rather than tried once. The session thread takes this mutex at the start of every
+     * accumulation iteration, and with DLSS there are four of them per pose - on all but the first
+     * it holds the lock for microseconds. Giving up on a lock that is about to be free cost a whole
+     * frame, and the counters said that was four refusals out of five.
+     *
+     * The wait is bounded so the UI cannot be dragged down by a genuinely long update: past it the
+     * frame is deferred exactly as before, and Blender comes back on the next event loop pass. */
+    const std::chrono::milliseconds lock_wait{3};
+    const bool not_locked = !not_ready && !session->scene->mutex.try_lock_for(lock_wait);
+
+    if (not_ready || not_locked) {
+      static const bool report_defer = getenv("CYCLES_DEBUG_VIEWPORT_PHASES") != nullptr;
+      if (report_defer) {
+        static int no_redraw_count = 0;
+        static int stale_texture_count = 0;
+        static int not_locked_count = 0;
+        static int would_also_block_count = 0;
+
+        if (not_ready) {
+          /* `ready_to_reset()` is false for two unrelated reasons, and telling them apart decides
+           * where the remaining work is.
+           *
+           * It reports `did_draw_after_reset_`, which needs BOTH the UI thread to have finished a
+           * viewport redraw since the reset AND the texture to have been fresh when it got there.
+           * The redraw is where the overlays run; the texture is what the render thread posts. So
+           * zero redraws means the frame is waiting on the UI thread - that is an overlay problem.
+           * Redraws that happened but found the texture outdated means it is waiting on tracing. */
+          if (session->draws_after_reset() == 0) {
+            no_redraw_count++;
+          }
+          else {
+            stale_texture_count++;
+          }
+
+          /* `not_locked` is only evaluated when the frame was otherwise ready, so the two counters
+           * never described competing causes. This asks the question the other branch never got
+           * to - untimed, so it cannot lengthen the refusal path the way a 3 ms wait would. */
+          if (session->scene->mutex.try_lock()) {
+            session->scene->mutex.unlock();
+          }
+          else {
+            would_also_block_count++;
+          }
+        }
+        not_locked_count += not_locked;
+
+        if ((no_redraw_count + stale_texture_count + not_locked_count) % 100 == 0) {
+          fprintf(stderr,
+                  "SYNC_DEFER no_redraw=%d stale_texture=%d not_locked=%d would_also_block=%d\n",
+                  no_redraw_count,
+                  stale_texture_count,
+                  not_locked_count,
+                  would_also_block_count);
+          fflush(stderr);
+        }
+      }
+      tag_update();
+      report_sync_timing();
+      return;
+    }
   }
 
   /* data and camera synchronize */
   b_depsgraph = &b_depsgraph_;
 
-  sync->sync_data(*b_render,
-                  *b_depsgraph,
-                  b_screen,
-                  b_v3d,
-                  b_rv3d,
-                  width,
-                  height,
-                  &python_thread_state,
-                  session_params.denoise_device);
-
-  if (b_rv3d) {
-    sync->sync_view(b_v3d, b_rv3d, width, height);
+  sync_deferred = false;
+  /* Labels the delivery diagnostic: which pose the pixels about to be produced belong to. Set
+   * before `sync_data` rather than after, so a delivery that races the end of the sync is labelled
+   * with the pose being worked on rather than the previous one. */
+  note_accepted_scene_frame(b_scene->r.cfra);
+  {
+    const double sync_data_start_time = report_sync ? time_dt() : 0.0;
+    sync->sync_data(*b_render,
+                    *b_depsgraph,
+                    b_screen,
+                    b_v3d,
+                    b_rv3d,
+                    width,
+                    height,
+                    &python_thread_state,
+                    session_params.denoise_device);
+    sync_data_ms = report_sync ? (time_dt() - sync_data_start_time) * 1000.0 : 0.0;
   }
-  else {
+
+  /* While a capture owns the view, only the capture's own draw may set the camera: a sync raised
+   * from the region on the main thread carries the region's matrices, and taking them would read
+   * as a camera move between the capture's frames. */
+  const bool region_sync_during_capture = b_engine.viewport_offscreen_capture &&
+                                          !b_engine.viewport_offscreen;
+  if (b_rv3d && !region_sync_during_capture) {
+    const bool viewport_mapping_changed = sync->sync_view(b_v3d, b_rv3d, width, height);
+    if (viewport_mapping_changed) {
+      session->request_denoiser_history_reset();
+      if (display_driver_) {
+        display_driver_->request_frame_generation_reset();
+      }
+    }
+    update_frame_generation_state();
+  }
+  else if (!b_rv3d) {
     sync->sync_camera(*b_render, width, height, "");
   }
 
@@ -848,8 +1326,20 @@ void BlenderSession::synchronize(blender::Depsgraph &b_depsgraph_)
     start_resize_time = 0.0;
   }
 
+  /* This frame's data is now in the session. Recorded only on the path that got here: the early
+   * returns above leave the previous value, so a refused sync cannot be mistaken for a synced
+   * frame. The published readiness is retired at the same time - a newly synced frame makes any
+   * previous completion stale, and this also covers a capture that revisits a frame number. */
+  playblast_synced_frame_ = b_scene->r.cfra;
+  b_engine.viewport_offscreen_frame = INT_MIN;
+  /* And the draw manager need not raise another update for this frame's offscreen draws: the
+   * capture clears this when it steps to the next frame. */
+  b_engine.viewport_offscreen_synced = true;
+
   /* unlock */
   session->scene->mutex.unlock();
+
+  report_sync_timing();
 
   /* Start rendering thread, if it's not running already. Do this
    * after all scene data has been synced at least once. */
@@ -876,7 +1366,7 @@ void BlenderSession::draw(blender::bScreen &b_screen, blender::SpaceImage &space
 
     Scene *scene = session->scene.get();
 
-    const thread_scoped_lock lock(scene->mutex);
+    const thread_scoped_timed_lock lock(scene->mutex);
 
     const Pass *pass = Pass::find(scene->passes, b_display_pass->name);
     if (!pass) {
@@ -901,14 +1391,35 @@ void BlenderSession::draw(blender::bScreen &b_screen, blender::SpaceImage &space
 
 void BlenderSession::view_draw(const int w, const int h)
 {
+  /* While a capture owns this view, a draw from the region does nothing. The region and the
+   * offscreen buffer differ in size, and the session treats every size change as a resize and
+   * resets: letting both draw would reset the session on every alternation, and the capture would
+   * sample the emptied display between them. The region keeps showing what its viewport retained. */
+  const bool capture = b_engine.viewport_offscreen_capture;
+  if (capture && !b_engine.viewport_offscreen) {
+    return;
+  }
+
   /* pause in redraw in case update is not being called due to final render */
   session->set_pause(BlenderSync::get_session_pause(*b_scene, background));
 
   /* Update navigating state. */
   const bool dimensions_changed = (width != w || height != h || pixelsize != blender::U.pixelsize);
-  const bool is_navigating = region_view3d_navigating_or_transforming(b_rv3d) ||
-                             dimensions_changed;
-  session->set_navigating(is_navigating);
+  const bool is_interacting = capture ? (playblast_mode_ == 0) :
+                                        (viewport_interaction_active(b_screen, b_rv3d) ||
+                                         dimensions_changed);
+  session->set_interaction_state(is_interacting);
+  session->set_volume_grid_hold(capture && playblast_mode_ == 0);
+
+  const bool show_fps = get_show_viewport_fps(*b_scene);
+  if (show_fps != show_viewport_fps) {
+    show_viewport_fps = show_fps;
+    /* The status text is only rebuilt when the session reports progress, and a finished render
+     * reports none - so toggling this would otherwise leave the previous text on screen. Clearing
+     * the last status makes the next build push its result through. */
+    last_status.clear();
+    update_status_progress();
+  }
 
   /* before drawing, we verify camera and viewport size changes, because
    * we do not get update callbacks for those, we must detect them here */
@@ -917,7 +1428,15 @@ void BlenderSession::view_draw(const int w, const int h)
 
     /* If dimensions changed, reset. We need to check pixel size here because
      * it's only valid during drawing, as it can change per window. */
-    if (dimensions_changed) {
+    if (dimensions_changed && b_engine.viewport_offscreen) {
+      /* A capture's size is settled by construction, and the debounce below would only make it
+       * wait out 0.2 s on every frame. */
+      width = w;
+      height = h;
+      pixelsize = blender::U.pixelsize;
+      reset = true;
+    }
+    else if (dimensions_changed) {
       if (start_resize_time == 0.0) {
         /* don't react immediately to resizes to avoid flickery resizing
          * of the viewport, and some window managers changing the window
@@ -943,9 +1462,19 @@ void BlenderSession::view_draw(const int w, const int h)
     else {
       /* update camera from 3d view */
 
-      sync->sync_view(b_v3d, b_rv3d, width, height);
+      const bool viewport_mapping_changed = sync->sync_view(b_v3d, b_rv3d, width, height);
+      const bool camera_modified = scene->camera->is_modified();
+      if (viewport_mapping_changed) {
+        session->request_denoiser_history_reset();
+        if (display_driver_) {
+          display_driver_->request_frame_generation_reset();
+        }
+      }
+      if (viewport_mapping_changed || camera_modified) {
+        update_frame_generation_state();
+      }
 
-      if (scene->camera->is_modified()) {
+      if (camera_modified) {
         reset = true;
       }
 
@@ -973,8 +1502,55 @@ void BlenderSession::view_draw(const int w, const int h)
   /* update status and progress for 3d view draw */
   update_status_progress();
 
+  /* Completion is sampled before the draw, deliberately: the final update can land between the
+   * draw and the check, and then a frame whose last pixels are not on the texture yet would be
+   * declared complete and read out one draw early. Sampled first, "complete" always refers to
+   * data the draw that follows had a chance to show. */
+  const bool complete = session->is_render_complete();
+
   /* draw */
-  session->draw();
+  const bool fresh = session->draw();
+
+  /* Publish, for an offscreen capture, whether the frame it is about to read is there. Both facts
+   * are needed: `playblast_synced_frame_` says this frame's data reached the session at all -
+   * a refused sync leaves it behind, and then the completion belongs to an older frame - and
+   * `fresh` says the draw that just happened put the current pixels on the texture. The fast mode
+   * stops there - one input per frame, reconstructed over the history of the frames before, the
+   * way the viewport plays back - and so runs at the viewport's own rate; the converging one also
+   * wants the accumulation finished. */
+  b_engine.viewport_offscreen_sync = playblast_participates();
+  if (b_engine.viewport_offscreen_sync && playblast_synced_frame_ == b_scene->r.cfra && fresh &&
+      (complete || playblast_mode_ == 0))
+  {
+    b_engine.viewport_offscreen_frame = b_scene->r.cfra;
+  }
+}
+
+bool BlenderSession::playblast_participates() const
+{
+  /* Every branch here is a way for the engine to be unable to report completion. Returning false
+   * removes the wait entirely, so the capture reads what is there rather than waiting out a cap on
+   * every frame - the failure mode has to be "no wait", never "stuck". */
+  if (!b_engine.viewport_offscreen_capture || background || b_v3d == nullptr) {
+    return false;
+  }
+  if (!session || !scene || session->progress.get_error()) {
+    return false;
+  }
+
+  /* Paused renders never finish, by definition. */
+  if (BlenderSync::get_session_pause(*b_scene, background)) {
+    return false;
+  }
+
+  /* Both modes wait for the accumulation to finish - fast within the moving viewport's budget,
+   * converging within the sample count - and with Viewport Samples at zero the converging one
+   * never does: the scheduler runs to Max Samples. */
+  if (playblast_mode_ != 0 && session->params.samples == INT_MAX) {
+    return false;
+  }
+
+  return true;
 }
 
 void BlenderSession::get_status(string &status, string &substatus)
@@ -1025,6 +1601,20 @@ void BlenderSession::update_status_progress()
     }
 
     timestatus += string_printf("Mem: %dM | ", (int)ceilf(mem_used));
+  }
+  else if (display_driver_ && show_viewport_fps) {
+    /* How often the viewport actually receives new rendered pixels. Blender's own playback counter
+     * measures the timeline instead, which during a Rendered viewport says nothing about the
+     * renderer - the timeline can run ahead while the same image is redrawn. Shown whether or not an
+     * animation is playing, since the question "how many fps does full shading give me" applies
+     * just as much to orbiting a still frame.
+     *
+     * Reported through the engine status rather than drawn separately, so that Blender lays it out
+     * with the rest of the viewport text and it cannot land on top of another overlay line. */
+    const double delivered_fps = display_driver_->get_delivered_fps();
+    if (delivered_fps > 0.0) {
+      timestatus += string_printf("Viewport: %.1f fps | ", delivered_fps);
+    }
   }
 
   const double current_time = time_dt();
@@ -1110,6 +1700,9 @@ void BlenderSession::free_blender_memory_if_possible()
     return;
   }
   RE_engine_free_blender_memory(&b_engine);
+  /* The evaluated scene is owned by the render engine and becomes invalid above. Keep the
+   * pointer state truthful so late frame-finish hooks cannot query RNA through freed memory. */
+  b_scene = nullptr;
 }
 
 void BlenderSession::ensure_display_driver_if_needed()

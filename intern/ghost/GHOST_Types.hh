@@ -822,6 +822,12 @@ enum GHOST_TVSyncModes {
   GHOST_kVSyncModeOff = 0,
   /** Force enable. */
   GHOST_kVSyncModeOn = 1,
+  /**
+   * Enable, and present in refresh order rather than replacing a queued frame with a newer one.
+   * Vulkan only - it selects FIFO over MAILBOX. An OpenGL context must never be handed this value:
+   * there the number is the swap interval, and two means every second refresh.
+   */
+  GHOST_kVSyncModeStrict = 2,
 };
 
 /**

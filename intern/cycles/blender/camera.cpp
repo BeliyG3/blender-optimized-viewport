@@ -1158,7 +1158,16 @@ static void blender_camera_border(BlenderCamera *bcam,
   bcam->border = bcam->border.clamp();
 }
 
-void BlenderSync::sync_view(blender::View3D *b_v3d,
+static bool viewport_camera_border_changed(const Camera *cam, const BoundBox2D &border)
+{
+  constexpr float epsilon = 1e-6f;
+  return fabsf(cam->get_viewport_camera_border_left() - border.left) > epsilon ||
+         fabsf(cam->get_viewport_camera_border_right() - border.right) > epsilon ||
+         fabsf(cam->get_viewport_camera_border_bottom() - border.bottom) > epsilon ||
+         fabsf(cam->get_viewport_camera_border_top() - border.top) > epsilon;
+}
+
+bool BlenderSync::sync_view(blender::View3D *b_v3d,
                             blender::RegionView3D *b_rv3d,
                             const int width,
                             const int height)
@@ -1169,6 +1178,8 @@ void BlenderSync::sync_view(blender::View3D *b_v3d,
       &bcam, *b_engine, b_render_settings, *b_scene, *b_data, b_v3d, b_rv3d, width, height);
   blender_camera_border(
       &bcam, *b_engine, b_render_settings, *b_scene, *b_data, b_v3d, b_rv3d, width, height);
+  const bool viewport_mapping_changed = viewport_camera_border_changed(
+      scene->camera, bcam.viewport_camera_border);
   bcam.motion_steps = scene->need_motion() == Scene::MOTION_PASS_INTERACTIVE ? 2 : 0;
   blender::PointerRNA scene_rna_ptr = RNA_id_pointer_create(&b_scene->id);
   blender::PointerRNA cscene = RNA_pointer_get(&scene_rna_ptr, "cycles");
@@ -1189,6 +1200,8 @@ void BlenderSync::sync_view(blender::View3D *b_v3d,
   else {
     *scene->dicing_camera = *scene->camera;
   }
+
+  return viewport_mapping_changed;
 }
 
 BufferParams BlenderSync::get_buffer_params(blender::View3D *b_v3d,

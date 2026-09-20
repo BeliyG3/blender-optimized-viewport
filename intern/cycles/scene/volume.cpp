@@ -746,13 +746,16 @@ void VolumeManager::tag_update(const set<Object *> &objects, uint32_t flag)
 
   bool volume_object_updated = false;
   for (const Object *object : objects) {
-    if (!object->get_geometry()->has_volume) {
+    /* Same as in `Scene::delete_node`: an object without geometry is unusual but reachable, and
+     * this runs on objects that are being deleted. */
+    const Geometry *geometry = object->get_geometry();
+    if (!geometry || !geometry->has_volume) {
       continue;
     }
 
     volume_object_updated = true;
 
-    for (const Node *node : object->get_geometry()->get_used_shaders()) {
+    for (const Node *node : geometry->get_used_shaders()) {
       const Shader *shader = static_cast<const Shader *>(node);
       if (shader->has_volume_spatial_varying || (flag & ObjectManager::OBJECT_REMOVED)) {
         /* TODO(weizhen): no need to update if the spatial variation is not in world space. */

@@ -40,6 +40,8 @@ enum class VKNodeType {
   END_QUERY,
   END_RENDERING,
   FILL_BUFFER,
+  FRAME_GENERATION,
+  RAY_RECONSTRUCTION,
   RESET_QUERY_POOL,
   SYNCHRONIZATION,
   UPDATE_BUFFER,
@@ -75,6 +77,12 @@ BLI_INLINE std::ostream &operator<<(std::ostream &os, const VKNodeType node_type
       break;
     case VKNodeType::FILL_BUFFER:
       os << "FILL_BUFFER";
+      break;
+    case VKNodeType::FRAME_GENERATION:
+      os << "FRAME_GENERATION";
+      break;
+    case VKNodeType::RAY_RECONSTRUCTION:
+      os << "RAY_RECONSTRUCTION";
       break;
     case VKNodeType::COPY_BUFFER:
       os << "COPY_BUFFER";

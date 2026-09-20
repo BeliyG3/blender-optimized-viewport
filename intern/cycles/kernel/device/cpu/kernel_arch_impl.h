@@ -31,6 +31,8 @@
 #    include "kernel/film/read.h"
 #    include "kernel/film/volume_guiding_denoise.h"
 
+#    include "kernel/integrator/volume_froxel.h"
+
 #    include "kernel/bake/bake.h"
 
 #else
@@ -295,6 +297,22 @@ void KERNEL_FUNCTION_FULL_NAME(volume_guiding_filter_y)(const ThreadKernelGlobal
   (void)stride;
 #else
   volume_guiding_filter_y(kg, render_buffer, x, min_y, max_y, offset, stride);
+#endif
+}
+
+/* --------------------------------------------------------------------
+ * Camera-aligned volume grid.
+ */
+
+void KERNEL_FUNCTION_FULL_NAME(volume_froxel_inject)(const ThreadKernelGlobalsCPU *kg,
+                                                     const int column_index)
+{
+#ifdef KERNEL_STUB
+  STUB_ASSERT(KERNEL_ARCH, volume_froxel_inject);
+  (void)kg;
+  (void)column_index;
+#else
+  volume_froxel_inject(kg, column_index);
 #endif
 }
 

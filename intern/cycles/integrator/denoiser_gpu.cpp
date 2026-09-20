@@ -95,13 +95,15 @@ bool DenoiserGPU::denoise_buffer(const BufferParams &buffer_params,
     if (!denoise_pass(context, PASS_COMBINED)) {
       return false;
     }
-    if (!denoise_pass(context, PASS_SHADOW_CATCHER_MATTE)) {
-      return false;
-    }
+    if (params_.type != DENOISER_DLSS) {
+      if (!denoise_pass(context, PASS_SHADOW_CATCHER_MATTE)) {
+        return false;
+      }
 
-    /* Passes which do not need albedo and hence if real is present it needs to become fake. */
-    if (!denoise_pass(context, PASS_SHADOW_CATCHER)) {
-      return false;
+      /* Passes which do not need albedo and hence if real is present it needs to become fake. */
+      if (!denoise_pass(context, PASS_SHADOW_CATCHER)) {
+        return false;
+      }
     }
   }
 
@@ -134,9 +136,15 @@ bool DenoiserGPU::denoise_ensure(DenoiseContext &context)
   return true;
 }
 
-bool DenoiserGPU::denoise_filter_guiding_preprocess(const DenoiseContext &context)
+bool DenoiserGPU::denoise_filter_guiding_preprocess(DenoiseContext &context)
 {
   const BufferParams &buffer_params = context.buffer_params;
+
+  if (context.use_guiding_passes && !context.guiding_params.device_pointer) {
+    context.guiding_buffer.alloc_to_device(buffer_params.width * buffer_params.height *
+                                           context.guiding_params.pass_stride);
+    context.guiding_params.device_pointer = context.guiding_buffer.device_pointer;
+  }
 
   const int work_size = buffer_params.width * buffer_params.height;
 
@@ -181,6 +189,7 @@ DenoiserGPU::DenoiseContext::DenoiseContext(Device *device,
       pixel_jitter(pixel_jitter)
 {
   pass_motion = buffer_params.get_pass_offset(PASS_MOTION);
+  pass_motion_weight = buffer_params.get_pass_offset(PASS_MOTION_WEIGHT);
   pass_sample_count = buffer_params.get_pass_offset(PASS_SAMPLE_COUNT);
 
   if (params.passes & DENOISER_PASS_ALBEDO) {
@@ -226,10 +235,6 @@ DenoiserGPU::DenoiseContext::DenoiseContext(Device *device,
       }
 
       guiding_params.stride = buffer_params.width;
-
-      guiding_buffer.alloc_to_device(buffer_params.width * buffer_params.height *
-                                     guiding_params.pass_stride);
-      guiding_params.device_pointer = guiding_buffer.device_pointer;
     }
   }
 }
@@ -361,9 +366,15 @@ bool DenoiserGPU::denoise_filter_guiding_flip_y(const DenoiseContext &context)
   return true;
 }
 
-bool DenoiserGPU::denoise_filter_guiding_set_fake_albedo(const DenoiseContext &context)
+bool DenoiserGPU::denoise_filter_guiding_set_fake_albedo(DenoiseContext &context)
 {
   const BufferParams &buffer_params = context.buffer_params;
+
+  if (context.use_guiding_passes && !context.guiding_params.device_pointer) {
+    context.guiding_buffer.alloc_to_device(buffer_params.width * buffer_params.height *
+                                           context.guiding_params.pass_stride);
+    context.guiding_params.device_pointer = context.guiding_buffer.device_pointer;
+  }
 
   const int work_size = buffer_params.width * buffer_params.height;
 
@@ -397,7 +408,9 @@ void DenoiserGPU::denoise_color_read(const DenoiseContext &context, const Denois
 
   PassAccessor::Destination destination(pass_access_info.type, pass_access_info.mode);
   destination.d_pixels = context.render_buffers->buffer.device_pointer;
-  destination.num_components = 3;
+  /* DLSS reconstructs RGB but needs the source alpha for separate output-resolution scaling and
+   * premultiplication. Other denoisers operate on RGB only. */
+  destination.num_components = params_.type == DENOISER_DLSS ? 4 : 3;
   destination.pixel_offset = pass.denoised_offset;
   destination.pixel_stride = context.buffer_params.pass_stride;
 

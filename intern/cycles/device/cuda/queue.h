@@ -35,6 +35,7 @@ class CUDADeviceQueue : public DeviceQueue {
   bool synchronize() override;
 
   void zero_to_device(device_memory &mem) override;
+  void zero_to_device_prefix(device_memory &mem, const size_t num_bytes) override;
   void copy_to_device(device_memory &mem) override;
   void copy_from_device(device_memory &mem) override;
   void *copy_from_device_synchronized(device_memory &mem, vector<uint8_t> &storage) override;

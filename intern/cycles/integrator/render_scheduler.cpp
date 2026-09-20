@@ -88,8 +88,31 @@ void RenderScheduler::set_sample_params(const int num_samples,
   }
 }
 
+void RenderScheduler::set_interactive_sample_budget(const int num_samples)
+{
+  interactive_num_samples_ = num_samples;
+}
+
 int RenderScheduler::get_num_samples() const
 {
+  /* Offline DLSS has a dedicated iteration budget. Viewport DLSS uses the regular viewport sample
+   * limit, counting each independent 1-spp input as one temporal iteration. */
+  if (denoiser_params_.use && denoiser_params_.type == DENOISER_DLSS &&
+      denoiser_params_.dlss_offline)
+  {
+    return max(denoiser_params_.dlss_iterations, 1);
+  }
+
+  /* While the user is interacting, stop at the reduced budget and lean on the DLSS temporal
+   * history for the rest - the same trade real-time path tracers make. Accumulation resumes from
+   * the sample already reached as soon as interaction ends, without a session reset, so the
+   * settled image is unchanged. */
+  if (interactive_num_samples_ > 0 && !background_ && denoiser_params_.use &&
+      denoiser_params_.type == DENOISER_DLSS)
+  {
+    return min(num_samples_, max(interactive_num_samples_, 1));
+  }
+
   return num_samples_;
 }
 
@@ -288,7 +311,7 @@ bool RenderScheduler::done() const
     return true;
   }
 
-  return get_num_rendered_samples() >= num_samples_;
+  return get_num_rendered_samples() >= get_num_samples();
 }
 
 RenderWork RenderScheduler::get_render_work()
@@ -346,11 +369,37 @@ RenderWork RenderScheduler::get_render_work()
     render_work.resolution_divider *= denoiser_params_.upscale_factor;
   }
 
+  if (denoiser_params_.use && denoiser_params_.type == DENOISER_DLSS) {
+    render_work.dlss.iteration = state_.num_rendered_samples;
+
+    if (denoiser_params_.dlss_offline) {
+      render_work.dlss.reset_history = denoiser_params_.dlss_reset_history &&
+                                       render_work.dlss.iteration == 0;
+      render_work.dlss.zero_motion = denoiser_params_.dlss_zero_motion_first ||
+                                     render_work.dlss.iteration > 0;
+      render_work.dlss.jitter_from_iteration = true;
+    }
+    else {
+      /* Viewport. Iteration 0 carries the real motion vectors, which reproject the DLSS history
+       * from the previous frame onto this one. Iterations 1..N add independent one-sample inputs
+       * of an unchanged scene, so the history has to accumulate in place - re-applying the same
+       * frame-to-frame motion on each of them would drag the history along repeatedly.
+       *
+       * History reset stays driven by `PathTrace::request_denoiser_history_reset()`, and the
+       * jitter stays owned by `Scene::update_camera_resolution()` - see `RenderWork::dlss`. */
+      render_work.dlss.reset_history = false;
+      render_work.dlss.zero_motion = render_work.dlss.iteration > 0;
+      render_work.dlss.jitter_from_iteration = false;
+    }
+  }
+
   render_work.path_trace.start_sample = get_start_sample_to_path_trace();
   render_work.path_trace.num_samples = get_num_samples_to_path_trace();
   render_work.path_trace.sample_offset = get_sample_offset();
 
-  render_work.init_render_buffers = (render_work.path_trace.start_sample == get_sample_offset());
+  const bool use_dlss = denoiser_params_.use && denoiser_params_.type == DENOISER_DLSS;
+  render_work.init_render_buffers = (render_work.path_trace.start_sample == get_sample_offset()) ||
+                                    (use_dlss && !is_accumulating_in_buffer());
 
   /* NOTE: Rebalance scheduler requires current number of samples to not be advanced forward. */
   render_work.rebalance = work_need_rebalance();
@@ -862,8 +911,58 @@ static inline uint round_num_samples_to_power_of_2(const uint num_samples)
   return num_samples_down;
 }
 
+int RenderScheduler::get_dlss_samples_per_iteration()
+{
+  /* How many path-traced samples go into one reconstruction. Read once; the whole pipeline - the
+   * buffer's sample count, the colour scale on both sides of NGX and the display - has to agree on
+   * it. */
+  static const int samples_per_iteration = []() {
+    const char *value = getenv("CYCLES_DLSS_SAMPLES_PER_ITERATION");
+    const int parsed = (value != nullptr) ? atoi(value) : 1;
+    return clamp(parsed, 1, 16);
+  }();
+
+  return samples_per_iteration;
+}
+
+bool RenderScheduler::is_accumulating_in_buffer() const
+{
+  /* `CYCLES_DLSS_ACCUMULATE`: keep summing into the render buffer while the camera holds still.
+   *
+   * Off by default - this changes what the network is fed, and whether that helps is a measurement.
+   * A network trained on one noisy sample per frame may behave differently on an averaged input. */
+  static const bool accumulate = []() {
+    const char *value = getenv("CYCLES_DLSS_ACCUMULATE");
+    return (value != nullptr) && atoi(value) != 0;
+  }();
+
+  if (!accumulate || background_ || !denoiser_params_.use ||
+      denoiser_params_.type != DENOISER_DLSS)
+  {
+    return false;
+  }
+
+  /* `num_rendered_samples` is reset by `RenderScheduler::reset()`, which any camera change goes
+   * through, so a non-zero count is exactly "nothing has moved since the last reset". The first
+   * iteration after a reset still clears, which is what gives the network its fresh start. */
+  return state_.num_rendered_samples > 0;
+}
+
 int RenderScheduler::get_num_samples_to_path_trace() const
 {
+  if (denoiser_params_.use && denoiser_params_.type == DENOISER_DLSS) {
+    /* One path-traced sample per reconstruction is what the viewport has always done, and it is
+     * what the accumulation is built around. It also puts the reconstruction at its noisiest: on a
+     * dense medium in front of very bright emission, a single sample carries little signal, and no
+     * guide buffer can invent what is not there.
+     *
+     * Tracing several samples into the SAME buffer and reconstructing once costs proportionally
+     * more tracing but proportionally fewer reconstructions, and cuts the input's standard
+     * deviation by the square root of the count. Off by default; the environment variable is here
+     * to measure the trade before choosing one. */
+    return get_dlss_samples_per_iteration();
+  }
+
   if (state_.resolution_divider != pixel_size_) {
     return get_num_samples_during_navigation(state_.resolution_divider);
   }
@@ -871,7 +970,7 @@ int RenderScheduler::get_num_samples_to_path_trace() const
   /* Always start full resolution render  with a single sample. Gives more instant feedback to
    * artists, and allows to gather information for a subsequent path tracing works. Do it in the
    * headless mode as well, to give some estimate of how long samples are taking. */
-  if (state_.num_rendered_samples == 0) {
+  if (state_.num_rendered_samples == 0 && state_.last_display_update_sample == -1) {
     return 1;
   }
 
@@ -886,7 +985,8 @@ int RenderScheduler::get_num_samples_to_path_trace() const
    * more than N samples. */
   const int num_samples_pot = round_num_samples_to_power_of_2(num_samples_per_update);
 
-  const int max_num_samples_to_render = sample_offset_ + num_samples_ - path_trace_start_sample;
+  const int max_num_samples_to_render = sample_offset_ + get_num_samples() -
+                                        path_trace_start_sample;
 
   int num_samples_to_render = min(num_samples_pot, max_num_samples_to_render);
 
@@ -958,7 +1058,9 @@ int RenderScheduler::get_num_samples_to_path_trace() const
                                 min(num_samples_to_occupy, max_num_samples_to_render));
   }
 
-  if (limit_samples_per_update_) {
+  if (limit_samples_per_update_ &&
+      !(denoiser_params_.use && denoiser_params_.type == DENOISER_DLSS))
+  {
     num_samples_to_render = min(limit_samples_per_update_, num_samples_to_render);
   }
 
@@ -1035,7 +1137,7 @@ bool RenderScheduler::work_need_denoise(bool &delayed, bool &ready_to_display)
     return true;
   }
 
-  if (background_) {
+  if (background_ && denoiser_params_.type != DENOISER_DLSS) {
     /* Background render, only denoise when rendering the last sample. */
     /* TODO(sergey): Follow similar logic to viewport, giving an overview of how final denoised
      * image looks like even for the background rendering. */
@@ -1043,6 +1145,10 @@ bool RenderScheduler::work_need_denoise(bool &delayed, bool &ready_to_display)
   }
 
   /* Viewport render. */
+
+  if (denoiser_params_.type == DENOISER_DLSS) {
+    return true;
+  }
 
   /* Navigation might render multiple samples at a lower resolution. Those are not to be counted as
    * final samples. */
@@ -1084,6 +1190,25 @@ bool RenderScheduler::work_need_update_display(const bool denoiser_delayed)
     /* If denoiser has been delayed the display can not be updated as it will not contain
      * up-to-date state of the render result. */
     return false;
+  }
+
+  if (!background_ && denoiser_params_.use && denoiser_params_.type == DENOISER_DLSS) {
+    /* Cap at a rate the UI can consume; the interface itself redraws far more slowly than the
+     * render loop iterates. */
+    static const double kDLSSDisplayUpdateIntervalInSeconds = 1.0 / 60.0;
+
+    /* Viewport DLSS renders a single sample per work and force-disables adaptive sampling, so the
+     * `!adaptive_sampling_.use` shortcut below would push a full output-resolution display update
+     * on every iteration - dozens of them per animation frame, against a single UI redraw.
+     *
+     * The throttle intentionally uses `state_`, which `reset()` clears: a timestamp that survived a
+     * reset would delay the first update after it, and `PathTrace::ready_to_reset()` is gated on a
+     * draw having happened since the reset, so the viewport would end up dropping more frames
+     * rather than fewer. */
+    if (done() || state_.last_display_update_sample == -1) {
+      return true;
+    }
+    return (time_dt() - state_.last_display_update_time) > kDLSSDisplayUpdateIntervalInSeconds;
   }
 
   if (!adaptive_sampling_.use) {

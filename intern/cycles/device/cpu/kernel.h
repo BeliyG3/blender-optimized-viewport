@@ -87,6 +87,11 @@ class CPUKernels {
       volume_guiding_filter_x;
   FilterYFunction volume_guiding_filter_y;
 
+  /* Camera-aligned volume grid. */
+  using FroxelFunction =
+      CPUKernelFunction<void (*)(const ThreadKernelGlobalsCPU *kg, const int index)>;
+  FroxelFunction volume_froxel_inject;
+
   /* Cryptomatte. */
 
   using CryptomattePostprocessFunction = CPUKernelFunction<void (*)(

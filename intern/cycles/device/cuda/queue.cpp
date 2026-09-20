@@ -66,7 +66,13 @@ void CUDADeviceQueue::init_execution()
 {
   /* Synchronize all textures and memory copies before executing task.
    * Use default stream (nullptr) since that's what we will synchronize
-   * here to ensure all scene data is copied. */
+   * here to ensure all scene data is copied.
+   *
+   * NOTE: narrowing this to `cuStreamSynchronize(CU_STREAM_LEGACY)` was tried, on the reasoning
+   * that the only producers this queue depends on are the legacy stream and its own. It saves
+   * microseconds and is a prime suspect for a CUDA "Illegal address" fault seen afterwards - the
+   * work stream is created CU_STREAM_NON_BLOCKING, so a legacy-stream wait does not order it
+   * against the other non-blocking streams. Do not narrow it again without a memcheck run. */
   CUDAContextScope scope(cuda_device_);
   cuda_device_->load_image_info(nullptr);
   cuda_device_assert(cuda_device_, cuCtxSynchronize());
@@ -159,9 +165,15 @@ bool CUDADeviceQueue::synchronize()
 
 void CUDADeviceQueue::zero_to_device(device_memory &mem)
 {
+  zero_to_device_prefix(mem, mem.memory_size());
+}
+
+void CUDADeviceQueue::zero_to_device_prefix(device_memory &mem, const size_t num_bytes)
+{
   assert(mem.type != MEM_IMAGE_TEXTURE);
 
-  if (mem.memory_size() == 0) {
+  const size_t size = (num_bytes < mem.memory_size()) ? num_bytes : mem.memory_size();
+  if (size == 0) {
     return;
   }
 
@@ -180,8 +192,7 @@ void CUDADeviceQueue::zero_to_device(device_memory &mem)
   assert(d_ptr != 0);
 
   const CUDAContextScope scope(cuda_device_);
-  assert_success(cuMemsetD8Async((CUdeviceptr)d_ptr, 0, mem.memory_size(), cuda_stream_),
-                 "zero_to_device");
+  assert_success(cuMemsetD8Async((CUdeviceptr)d_ptr, 0, size, cuda_stream_), "zero_to_device");
 }
 
 void CUDADeviceQueue::copy_to_device(device_memory &mem)

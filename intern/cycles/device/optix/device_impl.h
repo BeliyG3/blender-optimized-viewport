@@ -41,6 +41,7 @@ enum {
   PG_RGEN_EVAL_CURVE_SHADOW_TRANSPARENCY,
   PG_RGEN_INIT_FROM_CAMERA,
   PG_RGEN_EVAL_VOLUME_DENSITY,
+  PG_RGEN_VOLUME_FROXEL_INJECT,
 
   /* Miss */
   PG_MISS,
@@ -119,6 +120,12 @@ class OptiXDevice : public CUDADevice {
 
  private:
   OptixTraversableHandle tlas_handle = 0;
+  /* Instance descriptions for the scene BVH, kept across builds. This used to be a local, so every
+   * build allocated 33858 records - 2.7 MB - on the host, allocated as much on the device, and
+   * freed both on the way out. The device allocation and its free are each an implicit
+   * synchronisation of the whole device, twice per frame, for a buffer whose size changes only when
+   * objects are added or removed. */
+  unique_ptr<device_vector<OptixInstance>> tlas_instances;
   vector<unique_ptr<device_only_memory<char>>> delayed_free_bvh_memory;
   thread_mutex delayed_free_bvh_mutex;
 

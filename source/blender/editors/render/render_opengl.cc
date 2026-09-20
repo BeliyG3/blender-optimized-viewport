@@ -6,6 +6,7 @@
  * \ingroup render
  */
 
+#include <climits>
 #include <condition_variable>
 #include <cstddef>
 #include <cstring>
@@ -21,6 +22,7 @@
 #include "BLI_string_utf8.h"
 #include "BLI_task.h"
 #include "BLI_task.hh"
+#include "BLI_time.h"
 #include "BLI_utildefines.h"
 #include "BLI_vector.hh"
 
@@ -62,6 +64,7 @@
 
 #include "MOV_write.hh"
 
+#include "RE_engine.h"
 #include "RE_pipeline.h"
 
 #include "BLT_translation.hh"
@@ -148,6 +151,25 @@ struct OGLRender : public RenderJobBase {
 
   eImageFormatDepth color_depth = R_IMF_CHAN_DEPTH_32;
   uint num_scheduled_frames = 0;
+
+  /* Waiting for the engine. A Rendered viewport draws an interactive engine session, and reading
+   * the offscreen buffer the instant after one draw takes whatever the session held then - for a
+   * path tracer just reset for the new frame, nothing. So the animation step is re-entrant: the
+   * frame is prepared once, then probed until the engine says its frame is on the display texture,
+   * and only then read out. `frame_prepared` is what keeps a re-entry from stepping the frame
+   * again; `recalc_cleared` keeps a re-entry from re-syncing every updated ID; `wait_started`
+   * bounds the wait, so a silent engine cannot hold a render forever. */
+  bool engine_wait = false;
+  /* With an engine to wait for, the animation is stepped on the main thread by this timer rather
+   * than in a job. The engine's callbacks run Python, and Python reads the region, the space and
+   * the view out of the context - and the context refuses every one of those to a thread that is
+   * not the main one (`ctx_wm_python_context_get`). A job holds the main thread's lock while it
+   * steps, which is not the same as being the main thread. */
+  wmTimer *timer = nullptr;
+  bool frame_prepared = false;
+  bool recalc_cleared = false;
+  bool wait_reported = false;
+  double wait_started = 0.0;
   std::mutex task_mutex;
   std::condition_variable task_condition;
 
@@ -260,6 +282,87 @@ static void screen_opengl_views_setup(OGLRender *oglrender)
   }
 
   RE_ReleaseResult(oglrender->re);
+}
+
+/* The engine of the captured view, when this capture waits for one. */
+static RenderEngine *screen_opengl_render_engine(const OGLRender *oglrender)
+{
+  if (!oglrender->engine_wait || oglrender->rv3d == nullptr || !oglrender->rv3d->view_render) {
+    return nullptr;
+  }
+  return RE_view_engine_get(oglrender->rv3d->view_render);
+}
+
+/* Draw the view once without reading it back. A draw is what makes the engine publish whether
+ * its frame is there, and an ImBuf with no pixels makes `ED_view3d_draw_offscreen_imbuf` skip the
+ * readback - which at 4K is 130 MB of floats per attempt, paid otherwise on every poll. */
+static void screen_opengl_render_probe(OGLRender *oglrender)
+{
+  Scene *scene = oglrender->scene;
+  Depsgraph *depsgraph = oglrender->depsgraph;
+  char err_out[256] = "unknown";
+  const bool draw_sky = (scene->r.alphamode == R_ADDSKY);
+  const int alpha_mode = (draw_sky) ? R_ADDSKY : R_ALPHAPREMUL;
+
+  BKE_scene_graph_evaluated_ensure(depsgraph, oglrender->bmain);
+
+  /* A probe exists to let the engine sync and draw, and to learn whether its frame is there; the
+   * pixels it produces are never read. The viewport compositor would still run over them - on a
+   * heavy scene measured at 70 ms of an 80 ms probe, several probes per frame - so it sits out
+   * the probe, the way the shading type is overridden for the duration of an offscreen draw. The
+   * real capture that follows runs it once, on the frame that is read. */
+  View3D *v3d = oglrender->v3d;
+  const View3DShadingUseCompositor use_compositor = v3d->shading.use_compositor;
+  v3d->shading.use_compositor = V3D_SHADING_USE_COMPOSITOR_DISABLED;
+
+  ImBuf *ibuf = ED_view3d_draw_offscreen_imbuf(depsgraph,
+                                               scene,
+                                               v3d->shading.type,
+                                               v3d,
+                                               oglrender->region,
+                                               oglrender->sizex,
+                                               oglrender->sizey,
+                                               ImBufFlags::Zero,
+                                               alpha_mode,
+                                               RE_GetActiveRenderView(oglrender->re),
+                                               true,
+                                               oglrender->ofs,
+                                               oglrender->viewport,
+                                               true,
+                                               err_out);
+  v3d->shading.use_compositor = use_compositor;
+  if (ibuf) {
+    IMB_freeImBuf(ibuf);
+  }
+}
+
+/* Whether the engine's frame for the current scene frame is on its display texture - or whether
+ * there is nothing to wait for, which is also "go ahead": an engine that does not ask to be waited
+ * for is read at once, as before, and a wait past the cap is reported once and given up. */
+static bool screen_opengl_render_engine_frame_ready(OGLRender *oglrender)
+{
+  const RenderEngine *engine = screen_opengl_render_engine(oglrender);
+  if (engine == nullptr || !engine->viewport_offscreen_sync) {
+    return true;
+  }
+  if (engine->viewport_offscreen_frame == oglrender->scene->r.cfra) {
+    return true;
+  }
+  constexpr double wait_cap_seconds = 30.0;
+  if (BLI_time_now_seconds() - oglrender->wait_started > wait_cap_seconds) {
+    if (!oglrender->wait_reported) {
+      oglrender->wait_reported = true;
+      std::unique_lock lock(oglrender->reports_mutex);
+      BKE_reportf(oglrender->reports,
+                  RPT_WARNING,
+                  "Viewport render: the render engine did not finish frame %d within %.0f s, "
+                  "reading what it has",
+                  oglrender->scene->r.cfra,
+                  wait_cap_seconds);
+    }
+    return true;
+  }
+  return false;
 }
 
 static void screen_opengl_render_doit(OGLRender *oglrender, RenderResult *rr)
@@ -526,6 +629,23 @@ static void screen_opengl_render_apply(OGLRender *oglrender)
   if (oglrender->write_still) {
     screen_opengl_render_write(oglrender);
   }
+}
+
+/* Probe until the engine's frame is there, then read it. For the blocking paths - a still, and the
+ * scripted animation - where there is no job timer to come back on. */
+static void screen_opengl_render_apply_when_ready(OGLRender *oglrender)
+{
+  if (oglrender->engine_wait) {
+    oglrender->wait_started = BLI_time_now_seconds();
+    while (true) {
+      screen_opengl_render_probe(oglrender);
+      if (screen_opengl_render_engine_frame_ready(oglrender)) {
+        break;
+      }
+      BLI_time_sleep_ms(2);
+    }
+  }
+  screen_opengl_render_apply(oglrender);
 }
 
 static void gather_frames_to_render_for_adt(const OGLRender *oglrender, const AnimData *adt)
@@ -826,6 +946,15 @@ static bool screen_opengl_render_init(bContext *C, wmOperator *op)
 
     oglrender->rv3d = static_cast<RegionView3D *>(oglrender->region->regiondata);
 
+    /* A Rendered view is an engine session, and the capture waits for it. Not for stereo: its
+     * views alternate cameras on the one session, and each would wait for the other's frame. */
+    if (oglrender->v3d->shading.type == OB_RENDER && oglrender->rv3d->view_render &&
+        oglrender->views_len == 1)
+    {
+      oglrender->engine_wait = true;
+      RE_view_engine_get(oglrender->rv3d->view_render)->viewport_offscreen_capture = true;
+    }
+
     /* MUST be cleared on exit */
     oglrender->scene->customdata_mask_modal = CustomData_MeshMasks{};
     ED_view3d_datamask(*oglrender->bmain,
@@ -932,9 +1061,24 @@ static void screen_opengl_render_end(OGLRender *oglrender)
 
   MEM_SAFE_DELETE(oglrender->seq_data.ibufs_arr);
 
+  /* Hand the view back: the region's draws start touching the session again, and the readiness
+   * fields go back to meaning nothing. */
+  if (RenderEngine *engine = screen_opengl_render_engine(oglrender)) {
+    engine->viewport_offscreen_capture = false;
+    engine->viewport_offscreen_sync = false;
+    engine->viewport_offscreen_frame = INT_MIN;
+  }
+  oglrender->engine_wait = false;
+
   oglrender->scene->customdata_mask_modal = CustomData_MeshMasks{};
 
-  if (oglrender->wm_job) { /* exec will not have a job */
+  const bool stepped_by_timer = (oglrender->timer != nullptr);
+  if (oglrender->timer) {
+    WM_event_timer_remove(oglrender->wm, oglrender->win, oglrender->timer);
+    oglrender->timer = nullptr;
+  }
+
+  if (oglrender->wm_job || stepped_by_timer) { /* exec will not have a job */
     Depsgraph *depsgraph = oglrender->depsgraph;
     oglrender->scene->r.cfra = oglrender->cfrao;
     BKE_scene_graph_update_for_newframe(depsgraph);
@@ -1161,6 +1305,12 @@ static bool screen_opengl_render_anim_step(OGLRender *oglrender)
   bool is_movie;
   RenderResult *rr;
 
+  /* A re-entry: the frame was prepared on an earlier call and the engine was not ready then.
+   * Everything up to the probe has been done; do not step the frame again. */
+  if (oglrender->frame_prepared) {
+    goto probe;
+  }
+
   /* go to next frame */
   if (scene->r.cfra < oglrender->nfra) {
     scene->r.cfra++;
@@ -1210,7 +1360,20 @@ static bool screen_opengl_render_anim_step(OGLRender *oglrender)
     WM_cursor_time(oglrender->win, scene->r.cfra);
   }
 
-  BKE_scene_graph_update_for_newframe(depsgraph);
+  /* With an engine to wait for, the recalc flags are left for it: the engine copies them into its
+   * own marks when it syncs, and that sync happens in the probe below, not here - this thread is
+   * not the main one, and the depsgraph update refuses to call the engine from it. */
+  if (oglrender->engine_wait) {
+    BKE_scene_graph_update_for_newframe_ex(depsgraph, false);
+    /* A new frame's data: the engine has to be told again on its next offscreen draw. */
+    RenderEngine *engine = screen_opengl_render_engine(oglrender);
+    if (engine != nullptr) {
+      engine->viewport_offscreen_synced = false;
+    }
+  }
+  else {
+    BKE_scene_graph_update_for_newframe(depsgraph);
+  }
 
   if (view_context) {
     if (oglrender->rv3d->persp == RV3D_CAMOB && oglrender->v3d->camera &&
@@ -1227,9 +1390,32 @@ static bool screen_opengl_render_anim_step(OGLRender *oglrender)
     BKE_scene_camera_switch_update(scene);
   }
 
+  oglrender->frame_prepared = true;
+  oglrender->recalc_cleared = false;
+  oglrender->wait_reported = false;
+  oglrender->wait_started = BLI_time_now_seconds();
+
+probe:
   if (oglrender->render_frames == nullptr ||
       BLI_BITMAP_TEST_BOOL(oglrender->render_frames, scene->r.cfra - scene->playback_start()))
   {
+    if (oglrender->engine_wait) {
+      screen_opengl_render_probe(oglrender);
+      if (!oglrender->recalc_cleared) {
+        /* The engine took its copy of the flags in the sync the probe just caused; clearing them
+         * now keeps every later probe from re-syncing every ID the frame touched. */
+        DEG_ids_clear_recalc(depsgraph, false);
+        oglrender->recalc_cleared = true;
+      }
+      if (!screen_opengl_render_engine_frame_ready(oglrender)) {
+        /* Not yet. Come back on the next step, with the frame still prepared. From the job this
+         * is the timer's next tick; from the blocking loop, a moment's pause first. */
+        if (!oglrender->wm_job && !oglrender->timer) {
+          BLI_time_sleep_ms(2);
+        }
+        return true;
+      }
+    }
     /* render into offscreen buffer */
     screen_opengl_render_apply(oglrender);
   }
@@ -1244,6 +1430,8 @@ static bool screen_opengl_render_anim_step(OGLRender *oglrender)
   }
 
 finally: /* Step the frame and bail early if needed */
+
+  oglrender->frame_prepared = false;
 
   /* go to next frame */
   oglrender->nfra += scene->r.frame_step;
@@ -1265,10 +1453,38 @@ static wmOperatorStatus screen_opengl_render_modal(bContext *C,
   /* Still render completes immediately, but still modal to show some feedback
    * in case render initialization takes a while. */
   if (!oglrender->is_animation) {
-    screen_opengl_render_apply(oglrender);
+    screen_opengl_render_apply_when_ready(oglrender);
     screen_opengl_render_end(oglrender);
     MEM_delete(oglrender);
     return OPERATOR_FINISHED;
+  }
+
+  if (oglrender->timer) {
+    if (event->type == EVT_ESCKEY) {
+      screen_opengl_render_end(oglrender);
+      MEM_delete(oglrender);
+      return OPERATOR_CANCELLED;
+    }
+    if (event->type == TIMER && event->customdata == oglrender->timer) {
+      /* One poll of the engine per tick while the frame is not there yet. Once a frame has been
+       * read and handed to the writer, the next frame is stepped in the same tick rather than on
+       * the next one: its sync is what puts the engine back to work, and every tick spent between
+       * the two is a tick the engine idles. The written frame's pixels are already in the render
+       * result, so the scene can move on under them. */
+      for (int steps = 0; steps < 2; steps++) {
+        if (!screen_opengl_render_anim_step(oglrender)) {
+          screen_opengl_render_end(oglrender);
+          MEM_delete(oglrender);
+          return OPERATOR_FINISHED;
+        }
+        if (oglrender->frame_prepared) {
+          /* Waiting on the engine: come back on the next tick. */
+          break;
+        }
+      }
+      WM_cursor_time(oglrender->win, oglrender->scene->r.cfra);
+    }
+    return OPERATOR_RUNNING_MODAL;
   }
 
   /* no running blender, remove handler and pass through */
@@ -1347,7 +1563,14 @@ static wmOperatorStatus screen_opengl_render_invoke(bContext *C,
   /* View may be changed above #USER_RENDER_DISPLAY_WINDOW. */
   oglrender->win = CTX_wm_window(C);
 
-  /* Setup animation job. */
+  /* Setup animation job - or, with an engine to wait for, a timer on the main thread, because
+   * the engine's callbacks cannot read the view from any other. */
+  if (anim && oglrender->engine_wait) {
+    G.is_break = false;
+    oglrender->timer = WM_event_timer_add(CTX_wm_manager(C), CTX_wm_window(C), TIMER, 0.002);
+    WM_event_add_modal_handler(C, op);
+    return OPERATOR_RUNNING_MODAL;
+  }
   if (anim) {
     G.is_break = false;
 
@@ -1381,7 +1604,7 @@ static wmOperatorStatus screen_opengl_render_exec(bContext *C, wmOperator *op)
   OGLRender *oglrender = static_cast<OGLRender *>(op->customdata);
 
   if (!oglrender->is_animation) { /* same as invoke */
-    screen_opengl_render_apply(oglrender);
+    screen_opengl_render_apply_when_ready(oglrender);
     screen_opengl_render_end(oglrender);
     MEM_delete(oglrender);
 

@@ -14,6 +14,10 @@
 #include "session/denoising.h"
 #include "session/merge.h"
 
+#ifdef WITH_DLSS
+#  include "integrator/denoiser_dlss.h"
+#endif
+
 #include "util/colorspace.h"
 #include "util/debug.h"
 #include "util/guiding.h"
@@ -26,8 +30,11 @@
 #include "util/task.h"
 #include "util/types.h"
 
+#include "GPU_frame_generation.hh"
 #include "GPU_state.hh"
+#include "IMB_colormanagement.hh"
 
+#include "DNA_scene_types.h"
 #include "DNA_screen_types.h"
 
 #include "scene/osl.h"
@@ -147,6 +154,48 @@ static PyObject *init_func(PyObject * /*self*/, PyObject *args)
   BlenderSession::headless = headless;
 
   Py_RETURN_NONE;
+}
+
+static PyObject *dlss_frame_generation_capabilities_func(PyObject * /*self*/, PyObject *args)
+{
+  unsigned long long scene_address = 0;
+  if (!PyArg_ParseTuple(args, "|K:dlss_frame_generation_capabilities", &scene_address)) {
+    return nullptr;
+  }
+
+  blender::gpu::FrameGenerationCapabilities capabilities =
+      blender::gpu::frame_generation_capabilities_get();
+  const blender::Scene *scene = reinterpret_cast<const blender::Scene *>(scene_address);
+  if (scene != nullptr && IMB_colormanagement_display_is_hdr(&scene->display_settings,
+                                                             scene->view_settings.view_transform))
+  {
+    capabilities.supported = false;
+    capabilities.active = false;
+    capabilities.reason = "DLSS Frame Generation is unavailable for HDR output";
+  }
+
+  return Py_BuildValue("{s:O,s:O,s:s,s:s,s:i}",
+                       "supported",
+                       capabilities.supported ? Py_True : Py_False,
+                       "active",
+                       capabilities.active ? Py_True : Py_False,
+                       "reason",
+                       capabilities.reason.c_str(),
+                       "backend",
+                       capabilities.backend.c_str(),
+                       "max_generated_frames",
+                       capabilities.max_generated_frames);
+}
+
+static PyObject *dlss_applied_preset_func(PyObject * /*self*/, PyObject * /*args*/)
+{
+#ifdef WITH_DLSS
+  /* What Ray Reconstruction actually ran with, in NGX's own words. Empty until a feature has been
+   * created - that is, until something has been rendered with DLSS on. */
+  return Py_BuildValue("{s:s}", "text", dlss_applied_preset().c_str());
+#else
+  return Py_BuildValue("{s:s}", "text", "");
+#endif
 }
 
 static PyObject *exit_func(PyObject * /*self*/, PyObject * /*args*/)
@@ -429,7 +478,7 @@ static PyObject *available_devices_func(PyObject * /*self*/, PyObject *args)
   for (size_t i = 0; i < devices.size(); i++) {
     const DeviceInfo &device = devices[i];
     const string type_name = Device::string_from_type(device.type);
-    PyObject *device_tuple = PyTuple_New(8);
+    PyObject *device_tuple = PyTuple_New(9);
     PyTuple_SET_ITEM(device_tuple, 0, pyunicode_from_string(device.description.c_str()));
     PyTuple_SET_ITEM(device_tuple, 1, pyunicode_from_string(type_name.c_str()));
     PyTuple_SET_ITEM(device_tuple, 2, pyunicode_from_string(device.id.c_str()));
@@ -439,6 +488,7 @@ static PyObject *available_devices_func(PyObject * /*self*/, PyObject *args)
         device_tuple, 5, PyBool_FromLong(device.denoisers & DENOISER_OPENIMAGEDENOISE));
     PyTuple_SET_ITEM(device_tuple, 6, PyBool_FromLong(device.denoisers & DENOISER_OPTIX));
     PyTuple_SET_ITEM(device_tuple, 7, PyBool_FromLong(device.has_execution_optimization));
+    PyTuple_SET_ITEM(device_tuple, 8, PyBool_FromLong(device.denoisers & DENOISER_DLSS));
     PyTuple_SET_ITEM(ret, i, device_tuple);
   }
 
@@ -832,6 +882,14 @@ static PyMethodDef methods[] = {
 #endif
     {"available_devices", available_devices_func, METH_VARARGS, ""},
     {"system_info", system_info_func, METH_NOARGS, ""},
+    {"dlss_frame_generation_capabilities",
+     dlss_frame_generation_capabilities_func,
+     METH_VARARGS,
+     "Return Vulkan DLSS Frame Generation availability and active state"},
+    {"dlss_applied_preset",
+     dlss_applied_preset_func,
+     METH_NOARGS,
+     "Return the Ray Reconstruction model NGX actually used"},
 
     /* Standalone denoising */
     {"denoise", (PyCFunction)denoise_func, METH_VARARGS | METH_KEYWORDS, ""},
@@ -928,6 +986,12 @@ void *blender::CCL_python_module_init()
   else {
     PyModule_AddObjectRef(mod, "with_openimagedenoise", Py_False);
   }
+
+#ifdef WITH_DLSS
+  PyModule_AddObjectRef(mod, "with_dlss", Py_True);
+#else
+  PyModule_AddObjectRef(mod, "with_dlss", Py_False);
+#endif
 
 #ifdef WITH_CYCLES_DEBUG
   PyModule_AddObjectRef(mod, "with_debug", Py_True);

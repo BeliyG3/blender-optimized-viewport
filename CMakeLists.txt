@@ -314,6 +314,12 @@ option(WITH_MANIFOLD "Enable features depending on Manifold (Fast Robust Boolean
 
 option(WITH_OPENIMAGEDENOISE "Enable the OpenImageDenoise compositing node" ON)
 
+option(WITH_DLSS "Enable NVIDIA DLSS Ray Reconstruction support" OFF)
+option(WITH_DLSS_FRAME_GENERATION
+  "Enable experimental NVIDIA DLSS Frame Generation for the Cycles rendered viewport"
+  OFF
+)
+
 option(WITH_OPENSUBDIV "Enable OpenSubdiv for surface subdivision" ON)
 
 option(WITH_POTRACE "Enable features relying on Potrace" ON)
@@ -943,6 +949,18 @@ if(NOT APPLE)
 else()
   option(WITH_VULKAN_BACKEND "Enable Vulkan as graphics backend (development option)" OFF)
   mark_as_advanced(WITH_VULKAN_BACKEND)
+endif()
+
+if(WITH_DLSS_FRAME_GENERATION)
+  if(NOT WIN32)
+    message(FATAL_ERROR "WITH_DLSS_FRAME_GENERATION currently requires Windows")
+  endif()
+  if(NOT WITH_DLSS)
+    message(FATAL_ERROR "WITH_DLSS_FRAME_GENERATION requires WITH_DLSS")
+  endif()
+  if(NOT WITH_VULKAN_BACKEND)
+    message(FATAL_ERROR "WITH_DLSS_FRAME_GENERATION requires WITH_VULKAN_BACKEND")
+  endif()
 endif()
 
 # Metal

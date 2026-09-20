@@ -11,6 +11,7 @@
 #include "DNA_scene_types.h"
 #include "DNA_vec_types.h"
 
+#include "GPU_frame_generation.hh"
 #include "GPU_framebuffer.hh"
 #include "GPU_texture.hh"
 
@@ -24,6 +25,26 @@ struct GPUOffScreen;
 namespace gpu {
 class FrameBuffer;
 }  // namespace gpu
+
+enum class GPUViewportFrameGenerationSubmitResult {
+  ACCEPTED,
+  RETRY,
+  FAILED,
+};
+
+struct GPUViewportFrameGenerationInput {
+  gpu::Texture *depth = nullptr;
+  gpu::Texture *motion = nullptr;
+  int2 full_size = int2(0);
+  int2 full_offset = int2(0);
+  int2 region_size = int2(0);
+  int2 render_size = int2(0);
+  uint64_t revision = 0;
+  uint64_t frame_id = 0;
+  bool reset = false;
+  bool present_generated = false;
+  gpu::FrameGenerationCamera camera;
+};
 
 GPUViewport *GPU_viewport_create();
 GPUViewport *GPU_viewport_stereo_create();
@@ -92,5 +113,23 @@ gpu::Texture *GPU_viewport_depth_texture(GPUViewport *viewport);
  */
 gpu::FrameBuffer *GPU_viewport_framebuffer_render_get(GPUViewport *viewport);
 gpu::FrameBuffer *GPU_viewport_framebuffer_overlay_get(GPUViewport *viewport);
+
+/**
+ * Mark the interactive viewport as a DLSS Frame Generation consumer for the current draw.
+ *
+ * The mark is cleared by #GPU_viewport_bind before every new viewport draw.
+ */
+void GPU_viewport_frame_generation_mark_active(GPUViewport *viewport);
+
+/**
+ * Keep the most recent paired real frame visible while Cycles prepares a new real frame.
+ */
+void GPU_viewport_frame_generation_hold_last_real(GPUViewport *viewport);
+
+/**
+ * Queue guides and camera state for evaluation after viewport color management.
+ */
+GPUViewportFrameGenerationSubmitResult GPU_viewport_frame_generation_submit(
+    GPUViewport *viewport, const GPUViewportFrameGenerationInput &input);
 
 }  // namespace blender

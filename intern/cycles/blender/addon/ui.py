@@ -19,6 +19,9 @@ from bl_ui.properties_view_layer import (
 )
 
 from bl_ui.properties_object import has_geometry_visibility
+from bpy.app.translations import (
+    pgettext_rpt as rpt_,
+)
 
 
 class CyclesPresetPanel(PresetPanel, Panel):
@@ -151,6 +154,9 @@ def show_preview_denoise_active(context):
     if not cscene.use_preview_denoising:
         return False
 
+    if cscene.use_dlss_preview:
+        return has_dlss_gpu_devices(context)
+
     if cscene.preview_denoiser == 'OPTIX':
         return has_optixdenoiser_gpu_devices(context)
 
@@ -190,6 +196,46 @@ def has_oidn_gpu_devices(context):
     return context.preferences.addons[__package__].preferences.has_oidn_gpu_devices()
 
 
+def has_dlss_gpu_devices(context):
+    return context.preferences.addons[__package__].preferences.has_dlss_gpu_devices()
+
+
+def draw_dlss_applied_preset(layout):
+    """The model Ray Reconstruction actually ran with.
+
+    Asking for a model is not the same as getting it: a driver profile can override the request, and
+    nothing in the picture says whether that happened - a wrong model reads as a render that is
+    merely too soft, or not denoised at all. NGX names the model it took, and this shows it.
+    """
+    try:
+        import _cycles
+        applied = _cycles.dlss_applied_preset()
+    except (ImportError, AttributeError):
+        return
+
+    text = applied.get("text", "")
+    if not text:
+        # Nothing has been reconstructed yet this session.
+        return
+
+    layout.row().label(text=text, translate=False, icon='INFO')
+
+
+def draw_approximate_volumes(layout, cscene):
+    """The volume grid, drawn the same whether or not DLSS is on.
+
+    It does not need DLSS - it replaces what the path tracer does with the medium, not what the
+    reconstruction does with the result - but the two are used together and belong side by side.
+    """
+    layout.separator()
+    col = layout.column(align=True)
+    col.prop(cscene, "use_approximate_volumes")
+    if cscene.use_approximate_volumes:
+        col.prop(cscene, "approximate_volumes_mode", text="Grid Applies")
+        col.prop(cscene, "approximate_volumes_distance")
+        col.prop(cscene, "approximate_volumes_light_samples")
+
+
 def has_optixdenoiser_gpu_devices(context):
     return context.preferences.addons[__package__].preferences.has_optixdenoiser_gpu_devices()
 
@@ -225,22 +271,38 @@ class CYCLES_RENDER_PT_sampling_viewport(CyclesButtonsPanel, Panel):
         scene = context.scene
         cscene = scene.cycles
 
+        use_dlss_preview = cscene.use_preview_denoising and cscene.use_dlss_preview
+
         layout.use_property_split = True
         layout.use_property_decorate = False
 
         heading = layout.column(align=True, heading="Noise Threshold")
+        heading.active = not use_dlss_preview
         row = heading.row(align=True)
         row.prop(cscene, "use_preview_adaptive_sampling", text="")
         sub = row.row()
         sub.active = cscene.use_preview_adaptive_sampling
         sub.prop(cscene, "preview_adaptive_threshold", text="")
 
-        if cscene.use_preview_adaptive_sampling:
-            col = layout.column(align=True)
+        col = layout.column(align=True)
+        if use_dlss_preview:
+            col.prop(cscene, "preview_samples", text="Max Samples")
+            if cscene.use_preview_adaptive_sampling:
+                sub = col.column(align=True)
+                sub.active = False
+                sub.prop(cscene, "preview_adaptive_min_samples", text="Min Samples")
+
+            heading = layout.column(align=True, heading="Interactive Limit")
+            row = heading.row(align=True)
+            row.prop(cscene, "use_dlss_interactive_samples", text="")
+            sub = row.row()
+            sub.active = cscene.use_dlss_interactive_samples
+            sub.prop(cscene, "dlss_interactive_samples", text="")
+        elif cscene.use_preview_adaptive_sampling:
             col.prop(cscene, "preview_samples", text="Max Samples")
             col.prop(cscene, "preview_adaptive_min_samples", text="Min Samples")
         else:
-            layout.prop(cscene, "preview_samples", text="Samples")
+            col.prop(cscene, "preview_samples", text="Samples")
 
 
 class CYCLES_RENDER_PT_sampling_viewport_denoise(CyclesButtonsPanel, Panel):
@@ -265,14 +327,70 @@ class CYCLES_RENDER_PT_sampling_viewport_denoise(CyclesButtonsPanel, Panel):
         col = layout.column()
         col.active = cscene.use_preview_denoising
 
+        col.prop(cscene, "use_dlss_preview")
+        if cscene.use_dlss_preview:
+            if has_dlss_gpu_devices(context):
+                col.prop(cscene, "dlss_preview_mode", text="Upscale Mode")
+                col.prop(cscene, "dlss_preset", text="Model")
+                draw_dlss_applied_preset(col)
+            else:
+                col.label(text=rpt_("DLSS unavailable; viewport uses OptiX fallback"), icon='INFO')
+                col.label(text=rpt_("Requires an RTX GPU and NVIDIA driver 590+"), icon='BLANK1')
+
+            # The build ships no DLSS library - NVIDIA's licence does not allow it beside a GPL
+            # application - so on a machine that has never installed one, DLSS silently falls back
+            # to OptiX and the reason is not visible from here. Offered wherever the driver has a
+            # library to copy; the same button lives in the add-on preferences.
+            from . import dlss_library
+            if dlss_library.is_supported() and dlss_library.installed_path("dlssd") is None:
+                if dlss_library.available_versions("dlssd"):
+                    missing = col.column(align=True)
+                    missing.label(text=rpt_("DLSS library is not installed yet"), icon='INFO')
+                    missing.operator(
+                        "cycles.install_dlss_library",
+                        text="Install from NVIDIA Driver",
+                        icon='IMPORT',
+                    ).feature = "dlssd"
+
+            frame_generation = col.column(align=True)
+            frame_generation.prop(cscene, "use_dlss_frame_generation")
+            try:
+                import _cycles
+                capabilities = _cycles.dlss_frame_generation_capabilities(scene.as_pointer())
+            except (ImportError, AttributeError, RuntimeError):
+                capabilities = {
+                    "supported": False,
+                    "backend": "Unknown",
+                    "reason": "Frame Generation capability check failed",
+                }
+
+            if not capabilities["supported"]:
+                frame_generation.label(text=rpt_(capabilities["reason"]), icon='INFO')
+                if capabilities["backend"] == "OpenGL":
+                    frame_generation.operator(
+                        "cycles.use_vulkan_next_launch",
+                        text="Use Vulkan on Next Launch",
+                        icon='FILE_REFRESH',
+                    )
+
+            # The rate at which the viewport receives new rendered pixels answers "how many fps does
+            # full shading give me", which Blender's own playback counter does not: that one measures
+            # how fast the timeline advances and keeps counting while the same image is re-blitted.
+            col.separator()
+            col.prop(cscene, "use_dlss_viewport_fps")
+
+            draw_approximate_volumes(col, cscene)
+            return
+
         sub = col.column()
         sub.active = show_preview_denoise_active(context)
         sub.prop(cscene, "preview_denoiser", text="Denoiser")
 
-        col.prop(cscene, "preview_denoising_input_passes", text="Passes")
-
         has_oidn_gpu = has_oidn_gpu_devices(context)
         effective_preview_denoiser = get_effective_preview_denoiser(context, has_oidn_gpu)
+
+        col.prop(cscene, "preview_denoising_input_passes", text="Passes")
+
         if effective_preview_denoiser == 'OPENIMAGEDENOISE':
             col.prop(cscene, "preview_denoising_prefilter", text="Prefilter")
             col.prop(cscene, "preview_denoising_quality", text="Quality")
@@ -283,6 +401,8 @@ class CYCLES_RENDER_PT_sampling_viewport_denoise(CyclesButtonsPanel, Panel):
             row = col.row()
             row.active = has_oidn_gpu_devices(context)
             row.prop(cscene, "preview_denoising_use_gpu", text="Use GPU")
+
+        draw_approximate_volumes(layout.column(), cscene)
 
 
 class CYCLES_RENDER_PT_sampling_render(CyclesButtonsPanel, Panel):
@@ -338,6 +458,23 @@ class CYCLES_RENDER_PT_sampling_render_denoise(CyclesButtonsPanel, Panel):
 
         col = layout.column()
         col.active = cscene.use_denoising
+
+        col.prop(cscene, "use_dlss_render")
+        if cscene.use_dlss_render:
+            col.prop(cscene, "dlss_render_mode", text="Upscale Mode")
+            col.prop(cscene, "dlss_still_iterations")
+            col.prop(cscene, "dlss_animation_iterations")
+            col.prop(cscene, "dlss_reset_iterations")
+            if not has_dlss_gpu_devices(context):
+                col.label(text=rpt_("DLSS unavailable; final render uses OptiX fallback"),
+                          icon='INFO')
+            view_layer = context.view_layer
+            if (view_layer.use_pass_cryptomatte_object or
+                    view_layer.use_pass_cryptomatte_material or
+                    view_layer.use_pass_cryptomatte_asset):
+                col.label(text=rpt_("Cryptomatte enabled; final render uses OptiX fallback"),
+                          icon='INFO')
+            return
 
         sub = col.column()
         sub.active = show_denoise_active(context)

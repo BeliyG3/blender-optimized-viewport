@@ -23,6 +23,7 @@
 #include "util/hash.h"
 #include "util/log.h"
 #include "util/math.h"
+#include "util/tbb.h"
 
 #include "DNA_modifier_types.h"
 
@@ -38,6 +39,38 @@
 using blender::Attribute;
 
 CCL_NAMESPACE_BEGIN
+
+/* Copying a mesh out of Blender is one task per geometry, so these loops already run alongside
+ * each other. Splitting a single loop only pays off on a mesh large enough to be the tail that the
+ * other tasks wait on - below the threshold the scheduling costs more than it saves. Every write
+ * goes to its source index, so the result is identical to the serial one byte for byte.
+ *
+ * The numbers matter more than they look. Only a handful of geometries change per frame - four on
+ * the scene this was tuned against - so the outer parallelism is four tasks, and on a 24-core
+ * machine everything else idles unless these loops split. The grain is what decides that: at 8192
+ * a mesh of 71000 corners becomes nine blocks and cannot occupy more than nine threads no matter
+ * how many are free. Both were set where the work-to-overhead ratio was already about 100:1;
+ * scheduling a TBB range costs a few microseconds, so 20:1 is still ample. */
+static constexpr size_t MESH_PARALLEL_THRESHOLD = 8192;
+static constexpr size_t MESH_PARALLEL_GRAIN = 2048;
+
+template<typename F>
+static void parallel_for_if(const bool parallel, const size_t begin, const size_t end, F &&func)
+{
+  if (parallel) {
+    parallel_for(blocked_range<size_t>(begin, end, MESH_PARALLEL_GRAIN),
+                 [&](const blocked_range<size_t> &range) {
+                   for (size_t i = range.begin(); i != range.end(); i++) {
+                     func(i);
+                   }
+                 });
+  }
+  else {
+    for (size_t i = begin; i < end; i++) {
+      func(i);
+    }
+  }
+}
 
 static void attr_create_motion_from_velocity(Mesh *mesh,
                                              const blender::Span<blender::float3> b_attr,
@@ -621,6 +654,27 @@ static void create_mesh(Scene *scene,
                         const float motion_scale,
                         const bool subdivision = false)
 {
+  /* Where the copy of one mesh goes. `GEOM_TASK` puts a single geometry at 5.0 ms per frame, which
+   * is the whole of what the walk waits for; half of the loops below already split across cores and
+   * half do not, and which half holds the time decides whether splitting the rest is worth
+   * anything. Printed per geometry rather than accumulated, because only one of the four matters. */
+  static const bool report_parts = getenv("CYCLES_DEBUG_VIEWPORT_PHASES") != nullptr;
+  const double parts_started = report_parts ? time_dt() : 0.0;
+  double ms_verts = 0.0, ms_normals = 0.0, ms_generated = 0.0, ms_faces = 0.0;
+  double ms_pointiness = 0.0, ms_island = 0.0, ms_generic = 0.0, ms_uv = 0.0;
+  /* Inside `faces`, which holds all of the 5 ms: two of the spans it reads are lazily computed by
+   * Blender, and asking for one is what triggers the computation. Those are separated from the
+   * copies that follow them, because a lazy evaluation is not something a parallel_for can help. */
+  double ms_tris_lazy = 0.0, ms_cnorm_lazy = 0.0;
+  double phase_started = parts_started;
+  auto stamp = [&](double &slot) {
+    if (report_parts) {
+      const double now = time_dt();
+      slot += (now - phase_started) * 1000.0;
+      phase_started = now;
+    }
+  };
+
   const blender::Span<blender::float3> positions = b_mesh.vert_positions();
   const blender::OffsetIndices faces = b_mesh.faces();
   const blender::Span<int> corner_verts = b_mesh.corner_verts();
@@ -659,20 +713,32 @@ static void create_mesh(Scene *scene,
   Attribute *attr_P = attributes.add(ATTR_STD_POSITION);
   attr_P->resize(positions.size());
   packed_float3 *verts = attr_P->data_for_write<packed_float3>();
-  for (const int i : positions.index_range()) {
-    verts[i] = make_float3(positions[i][0], positions[i][1], positions[i][2]);
-  }
+  /* One task per geometry already runs in parallel, so this only pays off on a mesh large enough
+   * to be the tail everything else waits on. Writes go to the source index, so the result is
+   * identical to the serial one byte for byte. */
+  parallel_for_if(positions.size() >= MESH_PARALLEL_THRESHOLD,
+                  size_t(0),
+                  size_t(positions.size()),
+                  [&](const size_t i) {
+                    verts[i] = make_float3(positions[i][0], positions[i][1], positions[i][2]);
+                  });
   mesh->tag_position_modified();
+  stamp(ms_verts);
 
   if (subdivision || !use_corner_normals) {
     Attribute *attr_N = attributes.add(ATTR_STD_VERTEX_NORMAL);
     packed_normal *N = attr_N->data_for_write<packed_normal>();
     const blender::Span<blender::float3> vert_normals = b_mesh.vert_normals();
-    for (const int i : vert_normals.index_range()) {
-      N[i] = packed_normal(
-          make_float3(vert_normals[i][0], vert_normals[i][1], vert_normals[i][2]));
-    }
+    parallel_for_if(vert_normals.size() >= MESH_PARALLEL_THRESHOLD,
+                    size_t(0),
+                    size_t(vert_normals.size()),
+                    [&](const size_t i) {
+                      N[i] = packed_normal(make_float3(
+                          vert_normals[i][0], vert_normals[i][1], vert_normals[i][2]));
+                    });
   }
+
+  stamp(ms_normals);
 
   const set<ustring> blender_uv_names = get_blender_uv_names(b_mesh);
 
@@ -709,6 +775,8 @@ static void create_mesh(Scene *scene,
     }
   }
 
+  stamp(ms_generated);
+
   auto clamp_material_index = [&](const int material_index) -> int {
     return clamp(material_index, 0, used_shaders.size() - 1);
   };
@@ -719,33 +787,48 @@ static void create_mesh(Scene *scene,
     bool *smooth = mesh->get_smooth().data();
     int *shader = mesh->get_shader().data();
 
+    /* Materialised before the parallel region: `corner_tris()` is lazily computed, and triggering
+     * that from inside would have every worker race for the same cache. */
     const blender::Span<blender::int3> b_corner_tris = b_mesh.corner_tris();
-    for (const int i : b_corner_tris.index_range()) {
-      const blender::int3 &tri = b_corner_tris[i];
-      triangles[i * 3 + 0] = corner_verts[tri[0]];
-      triangles[i * 3 + 1] = corner_verts[tri[1]];
-      triangles[i * 3 + 2] = corner_verts[tri[2]];
-    }
+    stamp(ms_tris_lazy);
+    parallel_for_if(size_t(b_corner_tris.size()) >= MESH_PARALLEL_THRESHOLD,
+                    size_t(0),
+                    size_t(b_corner_tris.size()),
+                    [&](const size_t i) {
+                      const blender::int3 &tri = b_corner_tris[i];
+                      triangles[i * 3 + 0] = corner_verts[tri[0]];
+                      triangles[i * 3 + 1] = corner_verts[tri[1]];
+                      triangles[i * 3 + 2] = corner_verts[tri[2]];
+                    });
 
     if (!material_indices.is_empty()) {
-      for (const int face : faces.index_range()) {
-        const int material_index = clamp_material_index(material_indices[face]);
-        const blender::IndexRange face_tris = blender::bke::mesh::face_triangles_range(faces,
-                                                                                       face);
-        std::fill_n(shader + face_tris.start(), face_tris.size(), material_index);
-      }
+      /* The triangle ranges of two faces never overlap, so the fills are independent. */
+      parallel_for_if(faces.size() >= MESH_PARALLEL_THRESHOLD,
+                      size_t(0),
+                      size_t(faces.size()),
+                      [&](const size_t face) {
+                        const int material_index = clamp_material_index(material_indices[face]);
+                        const blender::IndexRange face_tris =
+                            blender::bke::mesh::face_triangles_range(faces, face);
+                        std::fill_n(shader + face_tris.start(), face_tris.size(), material_index);
+                      });
     }
     else {
       std::fill(shader, shader + numtris, 0);
     }
 
     if (!sharp_faces.is_empty()) {
-      for (const int face : faces.index_range()) {
-        const bool face_smooth = !sharp_faces[face];
-        const blender::IndexRange face_tris = blender::bke::mesh::face_triangles_range(faces,
-                                                                                       face);
-        std::fill_n(smooth + face_tris.start(), face_tris.size(), face_smooth);
-      }
+      /* Same independence as the material fill above: the triangle ranges of two faces never
+       * overlap. */
+      parallel_for_if(faces.size() >= MESH_PARALLEL_THRESHOLD,
+                      size_t(0),
+                      size_t(faces.size()),
+                      [&](const size_t face) {
+                        const bool face_smooth = !sharp_faces[face];
+                        const blender::IndexRange face_tris =
+                            blender::bke::mesh::face_triangles_range(faces, face);
+                        std::fill_n(smooth + face_tris.start(), face_tris.size(), face_smooth);
+                      });
     }
     else {
       /* All faces are sharp or smooth. */
@@ -754,17 +837,22 @@ static void create_mesh(Scene *scene,
 
     if (use_corner_normals) {
       const blender::Span<blender::float3> b_corner_normals = b_mesh.corner_normals();
+      stamp(ms_cnorm_lazy);
       Attribute *attr_N = attributes.add(ATTR_STD_CORNER_NORMAL);
       packed_normal *N = attr_N->data_for_write<packed_normal>();
 
-      for (const int i : b_corner_tris.index_range()) {
-        const blender::int3 &tri = b_corner_tris[i];
-        for (int j = 0; j < 3; j++) {
-          const int corner = tri[j];
-          const float *normal = b_corner_normals[corner];
-          N[i * 3 + j] = packed_normal(make_float3(normal[0], normal[1], normal[2]));
-        }
-      }
+      parallel_for_if(b_corner_tris.size() >= MESH_PARALLEL_THRESHOLD,
+                      size_t(0),
+                      size_t(b_corner_tris.size()),
+                      [&](const size_t i) {
+                        const blender::int3 &tri = b_corner_tris[i];
+                        for (int j = 0; j < 3; j++) {
+                          const int corner = tri[j];
+                          const float *normal = b_corner_normals[corner];
+                          N[i * 3 + j] = packed_normal(
+                              make_float3(normal[0], normal[1], normal[2]));
+                        }
+                      });
     }
 
     mesh->tag_triangles_modified();
@@ -819,20 +907,47 @@ static void create_mesh(Scene *scene,
     mesh->tag_subd_ptex_offset_modified();
   }
 
+  stamp(ms_faces);
+
   /* Create all needed attributes.
    * The calculate functions will check whether they're needed or not.
    */
   if (mesh->need_attribute(scene, ATTR_STD_POINTINESS)) {
     attr_create_pointiness(mesh, positions, b_mesh.vert_normals(), b_mesh.edges(), subdivision);
   }
+  stamp(ms_pointiness);
   attr_create_random_per_island(scene, mesh, b_mesh, subdivision);
+  stamp(ms_island);
   attr_create_generic(scene, mesh, b_mesh, subdivision, need_motion, motion_scale);
+  stamp(ms_generic);
 
   if (subdivision) {
     attr_create_subd_uv_map(scene, mesh, b_mesh, blender_uv_names);
   }
   else {
     attr_create_uv_map(scene, mesh, b_mesh, blender_uv_names);
+  }
+  stamp(ms_uv);
+
+  if (report_parts) {
+    fprintf(stderr,
+            "MESH_PARTS name=%s verts=%d tris=%d total=%.2f pos=%.2f nor=%.2f gen=%.2f face=%.2f "
+            "tris_lazy=%.2f cnorm_lazy=%.2f "
+            "point=%.2f island=%.2f generic=%.2f uv=%.2f\n",
+            mesh->name.c_str(),
+            int(positions.size()),
+            numtris,
+            (time_dt() - parts_started) * 1000.0,
+            ms_verts,
+            ms_normals,
+            ms_generated,
+            ms_faces,
+            ms_tris_lazy,
+            ms_cnorm_lazy,
+            ms_pointiness,
+            ms_island,
+            ms_generic,
+            ms_uv);
   }
 
   /* For volume objects, create a matrix to transform from object space to

@@ -166,6 +166,7 @@ NODE_DEFINE(Integrator)
   denoiser_type_enum.insert("none", DENOISER_NONE);
   denoiser_type_enum.insert("optix", DENOISER_OPTIX);
   denoiser_type_enum.insert("openimagedenoise", DENOISER_OPENIMAGEDENOISE);
+  denoiser_type_enum.insert("dlss", DENOISER_DLSS);
 
   static NodeEnum denoiser_prefilter_enum;
   denoiser_prefilter_enum.insert("none", DENOISER_PREFILTER_NONE);
@@ -191,6 +192,17 @@ NODE_DEFINE(Integrator)
   SOCKET_BOOLEAN(denoise_use_gpu, "Denoise on GPU", true);
   SOCKET_ENUM(denoiser_quality, "Denoiser Quality", denoiser_quality_enum, DENOISER_QUALITY_HIGH);
   SOCKET_FLOAT(denoiser_upscale_factor, "Denoiser Upscale Factor", 1.0f);
+  SOCKET_BOOLEAN(dlss_offline, "DLSS Offline", false);
+  SOCKET_BOOLEAN(dlss_animation, "DLSS Animation", false);
+  SOCKET_BOOLEAN(dlss_reset_history, "DLSS Reset History", true);
+  SOCKET_BOOLEAN(dlss_zero_motion_first, "DLSS Zero Motion First", true);
+  SOCKET_INT(dlss_iterations, "DLSS Iterations", 1);
+  SOCKET_INT(dlss_preset, "DLSS Preset", 6);
+
+  SOCKET_BOOLEAN(use_approximate_volumes, "Use Approximate Volumes", true);
+  SOCKET_BOOLEAN(approximate_volumes_always, "Approximate Volumes Always", false);
+  SOCKET_FLOAT(approximate_volumes_distance, "Approximate Volumes Distance", 0.0f);
+  SOCKET_INT(approximate_volumes_light_samples, "Approximate Volumes Light Samples", 8);
 
   return type;
 }
@@ -211,7 +223,20 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
     }
   });
 
+  if (use_denoise && denoiser_type == DENOISER_DLSS) {
+    use_pixel_jitter = true;
+  }
+
   KernelIntegrator *kintegrator = &dscene->data.integrator;
+
+  /* The grid's own settings. The rest of its block - resolution, depth range, how much of the
+   * pixel it accounts for - is filled per frame by the path trace, which is the only thing that
+   * knows the buffer and the camera. */
+  KernelVolumeFroxel *kfroxel = &dscene->data.froxel;
+  kfroxel->requested = use_approximate_volumes;
+  kfroxel->always = approximate_volumes_always;
+  kfroxel->user_distance = approximate_volumes_distance;
+  kfroxel->light_samples = approximate_volumes_light_samples;
 
   device_free(device, dscene);
 
@@ -263,6 +288,69 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
 
   kintegrator->volume_ray_marching = volume_ray_marching;
   kintegrator->volume_max_steps = volume_max_steps;
+
+  /* Volume scattering probability guiding, overridable for measurement.
+   *
+   * Under DLSS the guiding runs blind: the render buffer is cleared before every iteration and the
+   * guiding filter runs after the trace, so the denoised guide passes always read zero during
+   * tracing. The probability then falls to `mix(attenuation, 0.5, 0.75)` - a constant near 0.62
+   * however dense the medium is. Whether that helps or hurts is a measurement, so the guiding can
+   * be switched off, the defensive mix moved, or the probability pinned outright.
+   *
+   *   CYCLES_VOLUME_SCATTER_GUIDING=0    guiding off, analytic attenuation as before VSPG
+   *   CYCLES_VOLUME_SCATTER_MIX=<0..1>   weight of the guided value against attenuation (0.75)
+   *   CYCLES_VOLUME_SCATTER_PROB=<0..1>  pin the probability; negative leaves it computed
+   *
+   * Read once per process: these select a configuration for a run, not per-frame behaviour. */
+  static const int guiding_enabled = []() {
+    const char *value = getenv("CYCLES_VOLUME_SCATTER_GUIDING");
+    return (value != nullptr) ? atoi(value) : 1;
+  }();
+  static const float guiding_mix = []() {
+    const char *value = getenv("CYCLES_VOLUME_SCATTER_MIX");
+    if (value == nullptr) {
+      return 0.75f;
+    }
+    const float parsed = (float)atof(value);
+    return (parsed < 0.0f) ? 0.0f : ((parsed > 1.0f) ? 1.0f : parsed);
+  }();
+  static const float probability_override = []() {
+    const char *value = getenv("CYCLES_VOLUME_SCATTER_PROB");
+    if (value == nullptr) {
+      /* Negative means "leave the probability to be computed". */
+      return -1.0f;
+    }
+    const float parsed = (float)atof(value);
+    return (parsed > 1.0f) ? 1.0f : parsed;
+  }();
+
+  /* Denoising features for surfaces with no BSDF - see the field's comment in data_template.h.
+   *
+   * A pixel that is purely emissive has no closure, so without this it goes to the denoiser with a
+   * zero normal and zero roughness: no direction at all, and the description of a mirror. Ray
+   * Reconstruction reads that as a specular surface it cannot reproject and barely filters it,
+   * which is what put ragged blotches over the lava.
+   *
+   * Writing the normal and roughness alone once measured worse than writing neither, and now it is
+   * clear why: the albedo for such a pixel is still the emitted radiance, so a model that believes
+   * the geometry then demodulates against a colour in the hundreds. The three go together - normal,
+   * roughness, and an albedo compressed by luminance - which is why the default sets all three.
+   * On the rig this took the frame from 0.0584 to 0.0402 mean absolute Laplacian with the contrast
+   * unchanged.
+   *
+   * Only for DLSS: OptiX has its own expectations and was not measured against this. */
+  const int emissive_features_default = (use_denoise && denoiser_type == DENOISER_DLSS) ? 11 : 0;
+  const int emissive_features = []() {
+    const char *value = getenv("CYCLES_DENOISING_EMISSIVE_FEATURES");
+    return (value != nullptr) ? atoi(value) : -1;
+  }();
+
+  kintegrator->volume_scatter_guiding = guiding_enabled;
+  kintegrator->volume_scatter_guiding_mix = guiding_mix;
+  kintegrator->volume_scatter_probability_override = probability_override;
+  kintegrator->denoising_emissive_features = (emissive_features >= 0) ?
+                                                 emissive_features :
+                                                 emissive_features_default;
 
   kintegrator->caustics_reflective = caustics_reflective;
   kintegrator->caustics_refractive = caustics_refractive;
@@ -406,6 +494,25 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
   clear_modified();
 }
 
+void Integrator::device_update_pixel_jitter(DeviceScene *dscene)
+{
+  KernelIntegrator *kintegrator = &dscene->data.integrator;
+
+  /* The order matters and mirrors `device_update`: the seed is derived from the sequence state as
+   * it stands, and only then does `next()` advance it. Swapping the two would shift the whole
+   * sequence by one step and change every rendered frame. */
+  if (use_custom_pixel_jitter_sample) {
+    kintegrator->seed = hash_uint2(seed, pixel_jitter_frame);
+    kintegrator->pixel_jitter = make_float2(custom_pixel_jitter_sample[0],
+                                            custom_pixel_jitter_sample[1]);
+    ++pixel_jitter_frame;
+  }
+  else {
+    kintegrator->seed = hash_uint3(seed, pixel_jitter_state.a2, pixel_jitter_state.a3);
+    kintegrator->pixel_jitter = pixel_jitter_state.next();
+  }
+}
+
 void Integrator::device_free(Device * /*unused*/, DeviceScene *dscene, bool force_free)
 {
   dscene->sample_pattern_lut.free_if_need_realloc(force_free);
@@ -539,6 +646,12 @@ DenoiseParams Integrator::get_denoise_params() const
   denoise_params.prefilter = denoiser_prefilter;
   denoise_params.quality = denoiser_quality;
   denoise_params.upscale_factor = denoiser_upscale_factor;
+  denoise_params.dlss_offline = dlss_offline;
+  denoise_params.dlss_animation = dlss_animation;
+  denoise_params.dlss_reset_history = dlss_reset_history;
+  denoise_params.dlss_zero_motion_first = dlss_zero_motion_first;
+  denoise_params.dlss_iterations = dlss_iterations;
+  denoise_params.dlss_preset = dlss_preset;
 
   return denoise_params;
 }

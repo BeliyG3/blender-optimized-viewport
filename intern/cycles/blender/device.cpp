@@ -174,6 +174,11 @@ DeviceInfo blender_device_info(blender::UserDef &b_preferences,
       device = Device::get_multi_device(devices, threads, background);
     }
     adjust_device_info(device, cpreferences, preview);
+
+    /* A command-line device override is authoritative for headless rendering.
+     * Keep the denoising device on the same GPU instead of leaving it at the
+     * user-preference default (often CPU in a portable/factory profile). */
+    preferences_device = device;
   }
   else {
     /* 1 is a "GPU compute" in properties.py for Scene settings. */

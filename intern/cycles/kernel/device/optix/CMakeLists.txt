@@ -55,6 +55,14 @@ if(WITH_CYCLES_CUDA_BINARIES AND WITH_CYCLES_DEVICE_OPTIX)
       -I "${CMAKE_CURRENT_SOURCE_DIR}/../../.."
       -o ${output})
 
+    # CUDA 12.1 uses the side-by-side MSVC 14.38 host compiler, but the main
+    # Blender build environment contributes the MSVC 14.44 STL include path.
+    # The OptiX kernels only use the CUDA-compatible subset of the STL, so
+    # allow this supported split-toolset configuration explicitly.
+    if(MSVC AND "${CUDA_VERSION}" LESS 124)
+      list(APPEND cuda_flags -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH)
+    endif()
+
     if(WITH_CYCLES_OSL)
       set(cuda_flags ${cuda_flags}
         -D OSL_LIBRARY_VERSION_CODE=${OSL_LIBRARY_VERSION_CODE})

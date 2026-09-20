@@ -2402,6 +2402,9 @@ void RE_RenderAnim(Render *re,
   G.is_rendering = true;
 
   re->flag |= R_ANIMATION;
+  if (sfra != efra) {
+    re->flag |= R_FRAME_SEQUENCE;
+  }
   DEG_graph_id_tag_update(re->main, re->pipeline_depsgraph, &re->scene->id, ID_RECALC_AUDIO_MUTE);
 
   scene->r.subframe = 0.0f;

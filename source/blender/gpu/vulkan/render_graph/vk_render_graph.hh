@@ -182,6 +182,10 @@ class VKRenderGraph : public NonCopyable {
   ADD_NODE(VKClearColorImageNode)
   ADD_NODE(VKClearDepthStencilImageNode)
   ADD_NODE(VKFillBufferNode)
+#if defined(WITH_DLSS_FRAME_GENERATION)
+  ADD_NODE(VKFrameGenerationNode)
+  ADD_NODE(VKRayReconstructionNode)
+#endif
   ADD_NODE(VKCopyBufferNode)
   ADD_NODE(VKCopyBufferToImageNode)
   ADD_NODE(VKCopyImageNode)

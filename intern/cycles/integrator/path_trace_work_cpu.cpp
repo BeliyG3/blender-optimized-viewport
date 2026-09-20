@@ -364,6 +364,25 @@ void PathTraceWorkCPU::denoise_volume_guiding_buffers()
   });
 }
 
+void PathTraceWorkCPU::build_volume_froxel_grid()
+{
+  const KernelVolumeFroxel &froxel = device_scene_->data.froxel;
+  const int num_columns = froxel.res_x * froxel.res_y;
+  if (num_columns <= 0) {
+    return;
+  }
+
+  tbb::task_arena local_arena = local_tbb_arena_create(device_);
+
+  /* Injection first, then the front-to-back integration that reads what it wrote. */
+  local_arena.execute([&]() {
+    parallel_for(0, num_columns, [&](int column) {
+      ThreadKernelGlobalsCPU *kernel_globals = kernel_thread_globals_->data();
+      kernels_.volume_froxel_inject(kernel_globals, column);
+    });
+  });
+}
+
 #if defined(WITH_PATH_GUIDING)
 /* NOTE: It seems that this is called before every rendering iteration/progression and not once per
  * rendering. May be we find a way to call it only once per rendering. */

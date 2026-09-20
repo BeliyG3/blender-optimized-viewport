@@ -8,6 +8,9 @@
 
 #pragma once
 
+#include <cstdio>
+#include <cstdlib>
+
 #include "BKE_paint.hh"
 #include "DNA_volume_types.h"
 
@@ -47,6 +50,19 @@ class Wireframe : Overlay {
 
   /* Force display of wireframe on surface objects, regardless of the object display settings. */
   bool show_wire_ = false;
+
+  /* What actually lands in the wireframe pass when the wireframe overlay is off. The loose
+   * geometry branch below is not guarded by `show_surface_wire`, so it runs for every mesh
+   * regardless - and it is the reason the regular layer's pass is not empty even with wireframes
+   * disabled, which is what kept the depth copy alive. Counted to find out how many objects
+   * genuinely have loose parts versus how many just pay for the question.
+   *
+   * Static on purpose: there are two instances of this module, one per layer, and the reporting
+   * happens in whichever one reaches the print first. Per-instance counters reported zeros from
+   * the empty layer while the interesting numbers sat in the other one. */
+  static inline int loose_verts_draws_ = 0;
+  static inline int loose_edges_draws_ = 0;
+  static inline int loose_none_ = 0;
 
  public:
   void begin_sync(Resources &res, const State &state) final
@@ -204,10 +220,15 @@ class Wireframe : Overlay {
             geom = DRW_cache_mesh_all_verts_get(ob_ref.object);
             coloring.points_ps_->draw(
                 geom, manager.unique_handle(ob_ref), res.select_id(ob_ref).get());
+            loose_verts_draws_++;
           }
           else if ((geom = DRW_cache_mesh_loose_edges_get(ob_ref.object))) {
             coloring.mesh_all_edges_ps_->draw(
                 geom, manager.unique_handle(ob_ref), res.select_id(ob_ref).get());
+            loose_edges_draws_++;
+          }
+          else {
+            loose_none_++;
           }
         }
         break;
@@ -257,7 +278,44 @@ class Wireframe : Overlay {
 
   void copy_depth(TextureRef &depth_tx)
   {
-    if (!enabled_ || !do_depth_copy_workaround_) {
+    /* The copy exists so the wireframe shader can read the depth target it also writes to. If the
+     * pass has nothing to draw, nobody reads it - and the two existing conditions never asked that
+     * question, so the copy happened on every frame regardless.
+     *
+     * It is not a small copy. The viewport depth target is D32S8 and both aspects travel, which at
+     * 2560x1440 is about 29.5 MB per copy, read plus write, twice per frame for the regular and
+     * in-front layers. On Vulkan it costs more than the bytes suggest: the target has to leave
+     * DEPTH_ATTACHMENT_OPTIMAL for TRANSFER_SRC and come back, which on hardware with depth
+     * compression means decompressing the whole image, and the transfer has to be scheduled
+     * outside the rendering scope, so the copy splits the render pass by itself.
+     *
+     * A pass holding only a clear is not considered empty, so nothing that clears is lost. */
+    /* Whether the gate above actually fires. Measured in frames the change came out as nothing,
+     * and there are two ways that happens: the pass is not empty after all, or the copy is
+     * cheaper than its size suggests. Counting the two outcomes tells them apart instead of
+     * leaving it to argument. */
+    if (std::getenv("BLENDER_DEBUG_OVERLAY_DEPTH_COPY") != nullptr) {
+      static int skipped = 0;
+      static int copied = 0;
+      const bool skip = !enabled_ || !do_depth_copy_workaround_ || wireframe_ps_.is_empty();
+      (skip ? skipped : copied)++;
+      if ((skipped + copied) % 200 == 0) {
+        fprintf(stderr,
+                "OVERLAY_DEPTH_COPY skipped=%d copied=%d enabled=%d workaround=%d empty=%d "
+                "| loose verts=%d edges=%d none=%d\n",
+                skipped,
+                copied,
+                int(enabled_),
+                int(do_depth_copy_workaround_),
+                int(wireframe_ps_.is_empty()),
+                loose_verts_draws_,
+                loose_edges_draws_,
+                loose_none_);
+        fflush(stderr);
+      }
+    }
+
+    if (!enabled_ || !do_depth_copy_workaround_ || wireframe_ps_.is_empty()) {
       return;
     }
 

@@ -89,6 +89,10 @@ KERNEL_DATA_ARRAY(KernelOctreeRoot, volume_tree_roots)
 KERNEL_DATA_ARRAY(int, volume_tree_root_ids)
 KERNEL_DATA_ARRAY(float, volume_step_size)
 
+/* Camera-aligned volume grid. Written by the froxel kernels and read while shading, so it is
+ * writable; it lives on the device across frames and is rebuilt whenever the camera moves. */
+KERNEL_DATA_ARRAY_WRITABLE(float4, volume_froxel_scatter)
+
 /* image textures */
 KERNEL_DATA_ARRAY(KernelImageTexture, image_textures)
 KERNEL_DATA_ARRAY_WRITABLE(KernelTileDescriptor, image_texture_tile_descriptors)

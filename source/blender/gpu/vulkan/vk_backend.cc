@@ -23,6 +23,9 @@
 #include "vk_batch.hh"
 #include "vk_context.hh"
 #include "vk_fence.hh"
+#ifdef WITH_DLSS_FRAME_GENERATION
+#  include "vk_frame_generation.hh"
+#endif
 #include "vk_framebuffer.hh"
 #include "vk_ghost_api.hh"
 #include "vk_index_buffer.hh"
@@ -728,6 +731,9 @@ void VKBackend::platform_exit()
   GPG.clear();
   VKDevice &device = VKBackend::get().device;
   if (device.is_initialized()) {
+#ifdef WITH_DLSS_FRAME_GENERATION
+    vk_frame_generation_shutdown();
+#endif
     device.deinit();
   }
 }

@@ -46,6 +46,7 @@
 #include "BLI_math_base.h"
 #include "BLI_math_rotation.h"
 #include "BLI_path_utils.hh"
+#include "BLI_time.h"
 #include "BLI_string_utf8.h"
 #include "BLI_string_utils.hh"
 #include "BLI_threads.h"
@@ -2838,6 +2839,17 @@ void BKE_scene_graph_update_for_newframe_ex(Depsgraph *depsgraph, const bool cle
   Main *bmain = DEG_get_bmain(depsgraph);
   bool used_multiple_passes = false;
 
+  /* Diagnostics: what a frame change costs before the render engine ever sees it. Everything the
+   * viewport does per frame outside Cycles happens in here, and it had only ever been estimated by
+   * subtraction. Wall clock at a handful of points, no per-object timing that would distort it. */
+  static const bool report_frame = getenv("CYCLES_DEBUG_VIEWPORT_PHASES") != nullptr;
+  const double frame_start_time = report_frame ? BLI_time_now_seconds() : 0.0;
+  double eval_ms = 0.0;
+  double relations_ms = 0.0;
+  double sound_ms = 0.0;
+  double callbacks_ms = 0.0;
+  int passes_used = 0;
+
   /* Keep this first. */
   BKE_callback_exec_id(bmain, &scene->id, BKE_CB_EVT_FRAME_CHANGE_PRE);
 
@@ -2849,17 +2861,23 @@ void BKE_scene_graph_update_for_newframe_ex(Depsgraph *depsgraph, const bool cle
   BKE_main_view_layers_synced_ensure(bmain);
 
   for (int pass = 0; pass < 2; pass++) {
+    passes_used = pass + 1;
     /* Update animated image textures for particles, modifiers, gpu, etc,
      * call this at the start so modifiers with textures don't lag 1 frame.
      */
     BKE_image_editors_update_frame(bmain, scene->r.cfra);
+    const double relations_start = report_frame ? BLI_time_now_seconds() : 0.0;
     DEG_graph_relations_update(depsgraph);
+    if (report_frame) {
+      relations_ms += (BLI_time_now_seconds() - relations_start) * 1000.0;
+    }
     /* Update all objects: drivers, matrices, etc. flags set
      * by depsgraph or manual, no layer check here, gets correct flushed.
      *
      * NOTE: Only update for new frame on first iteration. Second iteration is for ensuring user
      * edits from callback are properly taken into account. Doing a time update on those would
      * lose any possible unkeyed changes made by the handler. */
+    const double eval_start = report_frame ? BLI_time_now_seconds() : 0.0;
     if (pass == 0) {
       const float frame = BKE_scene_frame_get(scene);
       DEG_evaluate_on_framechange(depsgraph, frame, DEG_EVALUATE_SYNC_WRITEBACK_YES);
@@ -2867,16 +2885,32 @@ void BKE_scene_graph_update_for_newframe_ex(Depsgraph *depsgraph, const bool cle
     else {
       DEG_evaluate_on_refresh(depsgraph, DEG_EVALUATE_SYNC_WRITEBACK_YES);
     }
+    if (report_frame) {
+      eval_ms += (BLI_time_now_seconds() - eval_start) * 1000.0;
+    }
+
     /* Update sound system animation. */
+    const double sound_start = report_frame ? BLI_time_now_seconds() : 0.0;
     BKE_scene_update_sound(depsgraph, bmain);
+    if (report_frame) {
+      sound_ms += (BLI_time_now_seconds() - sound_start) * 1000.0;
+    }
 
     /* Notify editors and python about recalc. */
     if (pass == 0) {
+      const double callbacks_start = report_frame ? BLI_time_now_seconds() : 0.0;
       BKE_callback_exec_id_depsgraph(bmain, &scene->id, depsgraph, BKE_CB_EVT_FRAME_CHANGE_POST);
+      if (report_frame) {
+        callbacks_ms += (BLI_time_now_seconds() - callbacks_start) * 1000.0;
+      }
 
       /* NOTE: Similar to this case in scene_graph_update_tagged(). Need to ensure that
        * DEG_editors_update() doesn't access freed memory of possibly removed ID. */
+      const double relations_again = report_frame ? BLI_time_now_seconds() : 0.0;
       DEG_graph_relations_update(depsgraph);
+      if (report_frame) {
+        relations_ms += (BLI_time_now_seconds() - relations_again) * 1000.0;
+      }
     }
 
     /* If user callback did not tag anything for update we can skip second iteration.
@@ -2898,13 +2932,33 @@ void BKE_scene_graph_update_for_newframe_ex(Depsgraph *depsgraph, const bool cle
   }
 
   const bool is_time_update = true;
+  const double editors_start = report_frame ? BLI_time_now_seconds() : 0.0;
   DEG_editors_update(depsgraph, is_time_update);
+  const double editors_ms = report_frame ? (BLI_time_now_seconds() - editors_start) * 1000.0 : 0.0;
 
   /* Clear recalc flags, can be skipped for example renderers that will read these
    * and clear the flags later. */
   if (clear_recalc) {
     const bool backup = false;
     DEG_ids_clear_recalc(depsgraph, backup);
+  }
+
+  if (report_frame) {
+    /* `editors` is where the render engine is driven from, so on a viewport frame it contains the
+     * whole of Cycles - it is reported to show what is left once that is taken out, not as a cost
+     * of its own. */
+    const double total_ms = (BLI_time_now_seconds() - frame_start_time) * 1000.0;
+    fprintf(stderr,
+            "FRAME_UPDATE total=%.2f eval=%.2f relations=%.2f editors=%.2f sound=%.2f "
+            "callbacks=%.2f passes=%d\n",
+            total_ms,
+            eval_ms,
+            relations_ms,
+            editors_ms,
+            sound_ms,
+            callbacks_ms,
+            passes_used);
+    fflush(stderr);
   }
 }
 

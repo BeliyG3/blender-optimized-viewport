@@ -639,6 +639,10 @@ bool oneapi_enqueue_kernel(KernelContext *kernel_context,
               kg, cgh, global_size, local_size, args, oneapi_kernel_volume_guiding_filter_y);
           break;
         }
+        case DEVICE_KERNEL_VOLUME_FROXEL_INJECT: {
+          oneapi_call(kg, cgh, global_size, local_size, args, oneapi_kernel_volume_froxel_inject);
+          break;
+        }
 
         /* clang-format off */
     #  define DEVICE_KERNEL_FILM_CONVERT_PARTIAL(VARIANT, variant) \
@@ -732,6 +736,7 @@ bool oneapi_enqueue_kernel(KernelContext *kernel_context,
           break;
         }
         /* Unsupported kernels */
+        default:
         case DEVICE_KERNEL_NUM:
         case DEVICE_KERNEL_INTEGRATOR_MEGAKERNEL:
         case DEVICE_KERNEL_INTEGRATOR_SHADOW_PATH_MNEE_PENDING:

@@ -42,6 +42,13 @@ class Object : public Node {
   /* Use base API because we need custom setter for tfm. */
   NODE_SOCKET_API_BASE(Transform, tfm, "tfm")
   BoundBox bounds;
+  /* Whether `bounds` still describes this object. Without motion blur the bounds are just the
+   * geometry's bounds through `tfm`, so only a changed transform or changed geometry can move
+   * them - and on a scene of 33858 instances where 73 move, recomputing all of them costs about
+   * 2 ms per scene update. It cannot be read off `is_modified()` at the point the bounds are
+   * computed: the object manager runs before the geometry manager and clears those flags on its
+   * way out, so the answer is carried here instead. */
+  bool bounds_need_update = true;
   NODE_SOCKET_API(uint, random_id)
   NODE_SOCKET_API(int, pass_id)
   NODE_SOCKET_API(float3, color)
@@ -144,7 +151,29 @@ class Object : public Node {
 class ObjectManager {
   uint32_t update_flags;
 
+  /* Raised when the interactive motion pass advanced the transform history, so the device copy of
+   * `object_motion_pass` still describes the movement of the frame that was just rendered and has
+   * to be settled back to zero before the next one.
+   *
+   * Deliberately kept out of `update_flags`: raising a manager flag for this used to cost a second
+   * full `Scene::device_update` per frame, because `tag_update` cascades into the geometry and
+   * light managers. `device_update_flags` also clears `update_flags`, and this one has to survive
+   * until the narrow flush actually reached the device. */
+  bool motion_history_pending = false;
+
+  /* The per-object offset arrays describe where each object's geometry sits, so they only go stale
+   * when something tagged this manager. They are uploaded outside `device_update`, past the point
+   * where `update_flags` has already been cleared, so the need is recorded separately. */
+  bool offsets_need_update = true;
+
  public:
+  /* Called by the geometry manager when a geometry's primitive offset actually moved - the only
+   * thing that can invalidate `object_prim_offset` apart from the set of objects changing. */
+  void tag_prim_offsets_modified()
+  {
+    offsets_need_update = true;
+  }
+
   enum : uint32_t {
     PARTICLE_MODIFIED = (1 << 0),
     GEOMETRY_MANAGER = (1 << 1),
@@ -168,6 +197,16 @@ class ObjectManager {
   ~ObjectManager();
 
   void update_interactive_motion(Scene *scene);
+
+  /* True when the transform history advanced and the device still holds the previous frame's
+   * motion. */
+  bool need_motion_history_flush() const;
+
+  /* Settles the advanced history on the device without going through the manager pipeline: only
+   * `object_motion_pass` is rewritten, leaving objects, flags, bounds, the scene BVH and the light
+   * tree untouched. Returns false when the resident state is not in a shape this can patch, in
+   * which case the caller has to fall back to a regular update. */
+  bool device_update_motion_history(DeviceScene *dscene, Scene *scene);
 
   void device_update(Device *device, DeviceScene *dscene, Scene *scene, Progress &progress);
   void device_update_transforms(DeviceScene *dscene, Scene *scene, Progress &progress);
@@ -195,7 +234,8 @@ class ObjectManager {
   void device_update_object_transform(UpdateObjectTransformState *state,
                                       Object *ob,
                                       bool update_all,
-                                      const Scene *scene);
+                                      const Scene *scene,
+                                      bool buffer_is_fresh);
   void device_update_object_transform_task(UpdateObjectTransformState *state);
   bool device_update_object_transform_pop_work(UpdateObjectTransformState *state,
                                                int *start_index,

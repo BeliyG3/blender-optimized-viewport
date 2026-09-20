@@ -36,6 +36,7 @@ struct RenderResult;
 struct ReportList;
 struct Scene;
 struct ViewLayer;
+struct GPUViewport;
 struct ViewRender;
 
 /* External Engine */
@@ -64,6 +65,8 @@ enum RenderEngineFlag {
   RE_ENGINE_RENDERING = (1 << 4),
   RE_ENGINE_HIGHLIGHT_TILES = (1 << 5),
   RE_ENGINE_CAN_DRAW = (1 << 6),
+  RE_ENGINE_FRAME_SEQUENCE = (1 << 7),
+  RE_ENGINE_FORCE_PERSISTENT_DATA = (1 << 8),
 };
 
 extern ListBaseT<RenderEngineType> R_engines;
@@ -168,6 +171,26 @@ struct RenderEngine {
   struct GPUContext *blender_gpu_context;
   /* Whether to restore DRWState after RenderEngine display pass. */
   bool gpu_restore_context;
+
+  /* Interactive viewport currently invoking view_draw. Null for F12 and offscreen rendering. */
+  struct GPUViewport *viewport;
+  /* Keep the last complete DLSSG real frame while Cycles prepares the next viewport frame. */
+  bool viewport_frame_generation_hold_last_real;
+
+  /* Offscreen capture of the interactive view - a viewport render or playblast, which draws the
+   * same engine session into an offscreen buffer and reads the pixels back. The stock path takes
+   * one `view_draw` of whatever the session holds at that instant and reads it out, which for a
+   * path tracer that has just been reset is nothing. These fields let the capture ask the engine
+   * whether the frame it is about to read is there yet.
+   *
+   * Written from the main thread only (the capture job holds the main-thread lock while it steps).
+   * Zeroed by `RE_engine_create`, so an engine that never sets `viewport_offscreen_sync` is never
+   * waited for - EEVEE, Workbench and third-party engines opt out by construction. */
+  bool viewport_offscreen; /* The view_draw in progress targets an offscreen buffer. Set by the draw manager. */
+  bool viewport_offscreen_capture; /* A capture owns this engine's view; region draws must not touch the session. Set by the capture. */
+  bool viewport_offscreen_sync; /* The engine asks the capture to wait for `viewport_offscreen_frame`. */
+  bool viewport_offscreen_synced; /* The engine took the current frame's data; an offscreen draw need not sync again. Cleared by the capture when it steps the frame. */
+  int viewport_offscreen_frame; /* Scene frame whose data is complete and on the display texture, else INT_MIN. */
 };
 
 RenderEngine *RE_engine_create(RenderEngineType *type);

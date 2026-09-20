@@ -11,6 +11,7 @@ CCL_NAMESPACE_BEGIN
 enum DenoiserType {
   DENOISER_OPTIX = 2,
   DENOISER_OPENIMAGEDENOISE = 4,
+  DENOISER_DLSS = 8,
   DENOISER_NUM,
 
   DENOISER_NONE = 0,
@@ -31,6 +32,7 @@ enum DenoiserPass {
   DENOISER_PASS_DEPTH = 1 << 4,
   DENOISER_PASS_MOTION = 1 << 5,
   DENOISER_PASS_BACKWARD_MOTION = 1 << 6,
+  DENOISER_PASS_SPECULAR_MOTION = 1 << 7,
 };
 
 using DenoiserPassMask = int;
@@ -87,6 +89,19 @@ class DenoiseParams : public Node {
   DenoiserPrefilter prefilter = DENOISER_PREFILTER_FAST;
   DenoiserQuality quality = DENOISER_QUALITY_HIGH;
   float upscale_factor = 1.0f;
+
+  /* Offline DLSS renders evaluate independent one-sample inputs while retaining temporal
+   *
+   * history. These are runtime controls and deliberately are not part of Blender DNA. */
+  bool dlss_offline = false;
+  bool dlss_animation = false;
+  bool dlss_reset_history = true;
+  bool dlss_zero_motion_first = true;
+  int dlss_iterations = 1;
+
+  /* Which Ray Reconstruction model to ask for, as the SDK numbers them: 0 leaves the choice to
+   * NGX, 4 is D, 5 is E, 6 is F. A driver profile can override whatever is asked for here. */
+  int dlss_preset = 6;
 
   static const NodeEnum *get_type_enum();
   static const NodeEnum *get_prefilter_enum();

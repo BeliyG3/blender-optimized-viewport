@@ -574,6 +574,19 @@ static void ExportCurveSegmentsMotion(Hair *hair, ParticleCurveData *CData, cons
 
 bool BlenderSync::object_has_particle_hair(blender::Object *b_ob)
 {
+  /* Walks the modifier stack, and an instanced object asks this once per instance. */
+  const auto cached = object_has_particle_hair_cache.find(b_ob);
+  if (cached != object_has_particle_hair_cache.end()) {
+    return cached->second;
+  }
+
+  const bool result = compute_object_has_particle_hair(b_ob);
+  object_has_particle_hair_cache.emplace(b_ob, result);
+  return result;
+}
+
+bool BlenderSync::compute_object_has_particle_hair(blender::Object *b_ob)
+{
   /* Test if the object has a particle modifier with hair. */
   for (blender::ModifierData &b_mod : b_ob->modifiers) {
     if ((b_mod.type == blender::eModifierType_ParticleSystem) &&

@@ -35,6 +35,8 @@
 #include "util/guarded_allocator.h"
 #include "util/log.h"
 #include "util/progress.h"
+#include "util/tbb.h"
+#include "util/thread.h"
 
 CCL_NAMESPACE_BEGIN
 
@@ -182,21 +184,62 @@ void Scene::device_update(Device *device_, Progress &progress)
   const bool print_stats = need_data_update();
   bool kernels_reloaded = false;
 
-  while (true) {
-    if (update_stats) {
-      update_stats->clear();
+  if (update_stats) {
+    update_stats->clear();
+  }
+
+  /* Timed and reported at function scope.
+   *
+   * This used to live inside the loop below, where the destructor fired at the loop's `break` -
+   * that is, before the object, geometry and light managers had run at all. The printed report
+   * therefore never contained the managers that dominate the cost, and the `device_update` entry
+   * measured only the shader prologue. On a 497-object scene the whole update is ~83 ms while the
+   * part the old timer covered is a fraction of a millisecond. */
+  /* Per-manager attribution of the update, behind CYCLES_DEBUG_VIEWPORT_PHASES. The full report
+   * above only appears when the update carries data changes, and it is far too verbose to read on
+   * every frame of playback; this is one line, always, so a shift between managers is visible.
+   * `unaccounted` is printed on purpose: the sum of named scopes is not the whole function, and a
+   * decomposition that quietly hides its remainder is how the previous one misled us. */
+  static const bool report_managers = getenv("CYCLES_DEBUG_VIEWPORT_PHASES") != nullptr;
+  double ms_objects = 0.0, ms_geometry = 0.0, ms_flags = 0.0, ms_offsets = 0.0, ms_light = 0.0;
+  double ms_shaders = 0.0, ms_images = 0.0, ms_history = 0.0, ms_rest = 0.0;
+  auto stamp = [](double &slot, const double started) { slot += (time_dt() - started) * 1000.0; };
+
+  const scoped_callback_timer timer([&](double time) {
+    if (report_managers) {
+      const double named = ms_objects + ms_geometry + ms_flags + ms_offsets + ms_light + ms_shaders
+                           + ms_images + ms_history + ms_rest;
+      fprintf(stderr,
+              "UPDATE_PARTS total=%.2f objects=%.2f geometry=%.2f flags=%.2f offsets=%.2f "
+              "light=%.2f shaders=%.2f images=%.2f history=%.2f rest=%.2f unaccounted=%.2f\n",
+              time * 1000.0,
+              ms_objects,
+              ms_geometry,
+              ms_flags,
+              ms_offsets,
+              ms_light,
+              ms_shaders,
+              ms_images,
+              ms_history,
+              ms_rest,
+              time * 1000.0 - named);
+      fflush(stderr);
     }
 
-    const scoped_callback_timer timer([this, print_stats](double time) {
-      if (update_stats) {
-        update_stats->scene.times.add_entry({"device_update", time});
+    if (update_stats) {
+      update_stats->scene.times.add_entry({"device_update", time});
 
-        if (print_stats) {
-          printf("Update statistics:\n%s\n", update_stats->full_report().c_str());
-        }
+      if (print_stats) {
+        /* stderr, so it interleaves correctly with the per-phase diagnostics: with the report on
+         * stdout and those on stderr the two streams buffer independently and a report ends up
+         * attributed to the wrong update. */
+        fprintf(stderr, "Update statistics:\n%s\n", update_stats->full_report().c_str());
+        fflush(stderr);
       }
-    });
+    }
+  });
 
+  while (true) {
     /* The order of updates is important, because there's dependencies between
      * the different managers, using data computed by previous managers. */
 
@@ -212,7 +255,11 @@ void Scene::device_update(Device *device_, Progress &progress)
     /* Compile shaders and get information about features they used. */
     progress.set_status("Updating Shaders");
     osl_manager->device_update_pre(device, this);
-    shader_manager->device_update_pre(device, &dscene, this, progress);
+    {
+      const double started = time_dt();
+      shader_manager->device_update_pre(device, &dscene, this, progress);
+      stamp(ms_shaders, started);
+    }
 
     if (progress.get_cancel() || device->have_error()) {
       return;
@@ -222,7 +269,14 @@ void Scene::device_update(Device *device_, Progress &progress)
     film->update_passes(this);
 
     /* Update kernel features. After shaders and passes since those affect features. */
-    update_kernel_features();
+    {
+      const scoped_callback_timer kernel_features_timer([this](double time) {
+        if (update_stats) {
+          update_stats->scene.times.add_entry({"update_kernel_features", time});
+        }
+      });
+      update_kernel_features();
+    }
 
     /* Load render kernels, before uploading most data to the GPU, and before displacement and
      * background light need to run kernels.
@@ -251,7 +305,11 @@ void Scene::device_update(Device *device_, Progress &progress)
   }
 
   /* Upload shaders to GPU and compile OSL kernels, after kernels have been loaded. */
-  shader_manager->device_update_post(device, &dscene, this, progress);
+  {
+      const double started = time_dt();
+      shader_manager->device_update_post(device, &dscene, this, progress);
+      stamp(ms_shaders, started);
+    }
   osl_manager->device_update_post(device, this, progress, kernels_reloaded);
 
   if (progress.get_cancel() || device->have_error()) {
@@ -286,21 +344,33 @@ void Scene::device_update(Device *device_, Progress &progress)
     return;
   }
 
-  geometry_manager->device_update_preprocess(device, this, progress);
+  {
+      const double started = time_dt();
+      geometry_manager->device_update_preprocess(device, this, progress);
+      stamp(ms_geometry, started);
+    }
   if (progress.get_cancel() || device->have_error()) {
     return;
   }
 
   /* Update objects after geometry preprocessing. */
   progress.set_status("Updating Objects");
-  object_manager->device_update(device, &dscene, this, progress);
+  {
+      const double started = time_dt();
+      object_manager->device_update(device, &dscene, this, progress);
+      stamp(ms_objects, started);
+    }
 
   if (progress.get_cancel() || device->have_error()) {
     return;
   }
 
   progress.set_status("Updating Particle Systems");
-  particle_system_manager->device_update(device, &dscene, this, progress);
+  {
+      const double started = time_dt();
+      particle_system_manager->device_update(device, &dscene, this, progress);
+      stamp(ms_rest, started);
+    }
 
   if (progress.get_cancel() || device->have_error()) {
     return;
@@ -308,7 +378,11 @@ void Scene::device_update(Device *device_, Progress &progress)
 
   /* Camera and shaders must be ready here for adaptive subdivision and displacement. */
   progress.set_status("Updating Meshes");
-  geometry_manager->device_update(device, &dscene, this, progress);
+  {
+      const double started = time_dt();
+      geometry_manager->device_update(device, &dscene, this, progress);
+      stamp(ms_geometry, started);
+    }
 
   if (progress.get_cancel() || device->have_error()) {
     return;
@@ -316,7 +390,11 @@ void Scene::device_update(Device *device_, Progress &progress)
 
   /* Update object flags with final geometry. */
   progress.set_status("Updating Objects Flags");
-  object_manager->device_update_flags(device, &dscene, this, progress);
+  {
+      const double started = time_dt();
+      object_manager->device_update_flags(device, &dscene, this, progress);
+      stamp(ms_flags, started);
+    }
 
   if (progress.get_cancel() || device->have_error()) {
     return;
@@ -324,7 +402,11 @@ void Scene::device_update(Device *device_, Progress &progress)
 
   /* Update BVH primitive objects with final geometry. */
   progress.set_status("Updating Primitive Offsets");
-  object_manager->device_update_prim_offsets(device, &dscene, this);
+  {
+      const double started = time_dt();
+      object_manager->device_update_prim_offsets(device, &dscene, this);
+      stamp(ms_offsets, started);
+    }
 
   if (progress.get_cancel() || device->have_error()) {
     return;
@@ -333,7 +415,11 @@ void Scene::device_update(Device *device_, Progress &progress)
   /* Images last, as they should be more likely to use host memory fallback than geometry.
    * Some images may have been uploaded early for displacement already at this point. */
   progress.set_status("Updating Images");
-  image_manager->device_update(device, this, progress);
+  {
+      const double started = time_dt();
+      image_manager->device_update(device, this, progress);
+      stamp(ms_images, started);
+    }
 
   if (progress.get_cancel() || device->have_error()) {
     return;
@@ -341,7 +427,11 @@ void Scene::device_update(Device *device_, Progress &progress)
 
   /* Evaluate volume shader to build volume octrees. */
   progress.set_status("Updating Volume");
-  volume_manager->device_update(device, &dscene, this, progress);
+  {
+      const double started = time_dt();
+      volume_manager->device_update(device, &dscene, this, progress);
+      stamp(ms_rest, started);
+    }
 
   if (progress.get_cancel() || device->have_error()) {
     return;
@@ -363,7 +453,11 @@ void Scene::device_update(Device *device_, Progress &progress)
 
   /* Light manager needs shaders and final meshes for triangles in light tree. */
   progress.set_status("Updating Lights");
-  light_manager->device_update(device, &dscene, this, progress);
+  {
+      const double started = time_dt();
+      light_manager->device_update(device, &dscene, this, progress);
+      stamp(ms_light, started);
+    }
 
   if (progress.get_cancel() || device->have_error()) {
     return;
@@ -409,9 +503,11 @@ void Scene::device_update(Device *device_, Progress &progress)
 
   if (need_motion() == MOTION_PASS_INTERACTIVE) {
     /* Swap current camera/object/vertex positions to previous positions for next frame. */
+    const double history_started = time_dt();
     camera->update_interactive_motion();
     object_manager->update_interactive_motion(this);
     geometry_manager->update_interactive_motion(this);
+    stamp(ms_history, history_started);
   }
 
   if (print_stats) {
@@ -431,11 +527,14 @@ Scene::MotionType Scene::need_motion() const
   if (integrator->get_motion_blur()) {
     return MOTION_BLUR;
   }
-  const bool denoiser_motion = integrator->get_use_denoise() &&
-                               (integrator->get_denoiser_passes() &
-                                (DENOISER_PASS_MOTION | DENOISER_PASS_BACKWARD_MOTION)) != 0;
+  const DenoiserPassMask denoiser_motion_passes = DENOISER_PASS_MOTION |
+                                                  DENOISER_PASS_BACKWARD_MOTION |
+                                                  DENOISER_PASS_SPECULAR_MOTION;
+  const bool denoiser_motion = (integrator->get_use_denoise()) &&
+                               (integrator->get_denoiser_passes() & denoiser_motion_passes) != 0;
   if (denoiser_motion || (Pass::contains(passes, PASS_MOTION) ||
-                          Pass::contains(passes, PASS_DENOISING_BACKWARD_MOTION)))
+                          Pass::contains(passes, PASS_DENOISING_BACKWARD_MOTION) ||
+                          Pass::contains(passes, PASS_DENOISING_SPECULAR_MOTION)))
   {
     return params.background ? MOTION_PASS : MOTION_PASS_INTERACTIVE;
   }
@@ -495,6 +594,41 @@ bool Scene::need_data_update()
 bool Scene::need_reset(const bool check_camera)
 {
   return need_data_update() || (check_camera && camera->is_modified());
+}
+
+string Scene::update_reason()
+{
+  /* Which managers are dirty going into a scene update. Distinguishes a genuinely new depsgraph
+   * state from the bookkeeping re-tag that the interactive motion pass performs at the end of every
+   * update - the two look identical in a timing report, and only the reason tells them apart. */
+  string reason;
+  const auto add = [&reason](const bool dirty, const char *name) {
+    if (dirty) {
+      if (!reason.empty()) {
+        reason += ",";
+      }
+      reason += name;
+    }
+  };
+
+  add(camera->is_modified(), "camera");
+  add(object_manager->need_update(), "object");
+  add(geometry_manager->need_update(), "geometry");
+  add(light_manager->need_update(), "light");
+  add(shader_manager->need_update(), "shader");
+  add(image_manager->need_update(), "image");
+  add(background->is_modified(), "background");
+  add(integrator->is_modified(), "integrator");
+  add(film->is_modified(), "film");
+  add(particle_system_manager->need_update(), "particles");
+  add(procedural_manager->need_update(), "procedural");
+  add(scene_attribute->is_modified(), "scene_attribute");
+  add(lookup_tables->need_update(), "tables");
+  add(bake_manager->need_update(), "bake");
+  add(object_manager->need_motion_history_flush(), "motion_history");
+  add(geometry_manager->need_motion_history_flush(), "deform_history");
+
+  return reason.empty() ? string("none") : reason;
 }
 
 void Scene::reset()
@@ -560,49 +694,80 @@ void Scene::update_kernel_features()
   bool has_caustics_caster = false;
   bool has_caustics_light = false;
 
-  for (Object *object : objects) {
-    if (object->get_is_caustics_caster()) {
-      has_caustics_caster = true;
-    }
-    else if (object->get_is_caustics_receiver()) {
-      has_caustics_receiver = true;
-    }
-    Geometry *geom = object->get_geometry();
-    if (use_motion) {
-      if (object->use_motion() || geom->get_use_motion_blur()) {
-        kernel_features |= KERNEL_FEATURE_OBJECT_MOTION;
-      }
-    }
-    if (object->get_is_shadow_catcher() && !geom->is_light()) {
-      kernel_features |= KERNEL_FEATURE_SHADOW_CATCHER;
-    }
-    if (geom->is_hair()) {
-      const Hair *hair = static_cast<const Hair *>(geom);
-      kernel_features |= (hair->curve_shape == CURVE_RIBBON) ? KERNEL_FEATURE_HAIR_RIBBON :
-                                                               KERNEL_FEATURE_HAIR_THICK;
-      kernel_max_prim_count = max(kernel_max_prim_count, hair->num_segments());
-    }
-    else if (geom->is_pointcloud()) {
-      kernel_features |= KERNEL_FEATURE_POINTCLOUD;
-      kernel_max_prim_count = max(kernel_max_prim_count,
-                                  static_cast<PointCloud *>(geom)->num_points());
-    }
-    else if (geom->is_mesh()) {
-      kernel_max_prim_count = max(kernel_max_prim_count,
-                                  static_cast<Mesh *>(geom)->num_triangles());
-    }
-    else if (geom->is_light()) {
-      const Light *light = static_cast<const Light *>(object->get_geometry());
-      if (light->get_use_caustics()) {
-        has_caustics_light = true;
-      }
-    }
-    if (object->has_light_linking()) {
-      kernel_features |= KERNEL_FEATURE_LIGHT_LINKING;
-    }
-    if (object->has_shadow_linking()) {
-      kernel_features |= KERNEL_FEATURE_SHADOW_LINKING;
-    }
+  /* Every object is asked about a dozen sockets here, and on a scene of 33858 instances that is
+   * about a millisecond of pointer chasing per scene update - paid in both the main pass and the
+   * motion-history pass, where nothing else runs at all. Nothing in the loop depends on the order
+   * of objects: the results are an OR of feature bits, a maximum, and three booleans. Reduced per
+   * block and merged afterwards, so the answer is identical to the sequential one. */
+  {
+    static const size_t OBJECTS_PER_TASK = 4096;
+    thread_mutex merge_mutex;
+
+    parallel_for(
+        blocked_range<size_t>(0, objects.size(), OBJECTS_PER_TASK),
+        [&](const blocked_range<size_t> &r) {
+          uint local_features = 0;
+          size_t local_max_prim_count = 0;
+          bool local_caustics_receiver = false;
+          bool local_caustics_caster = false;
+          bool local_caustics_light = false;
+
+          for (size_t i = r.begin(); i != r.end(); i++) {
+            Object *object = objects[i];
+            /* Deliberately `else if`, as it was: an object flagged as both counts only as a
+             * caster. Two independent accumulators would enable caustics on scenes that never
+             * had them, which changes the kernel feature set and forces a different kernel. */
+            if (object->get_is_caustics_caster()) {
+              local_caustics_caster = true;
+            }
+            else if (object->get_is_caustics_receiver()) {
+              local_caustics_receiver = true;
+            }
+            Geometry *geom = object->get_geometry();
+            if (use_motion) {
+              if (object->use_motion() || geom->get_use_motion_blur()) {
+                local_features |= KERNEL_FEATURE_OBJECT_MOTION;
+              }
+            }
+            if (object->get_is_shadow_catcher() && !geom->is_light()) {
+              local_features |= KERNEL_FEATURE_SHADOW_CATCHER;
+            }
+            if (geom->is_hair()) {
+              const Hair *hair = static_cast<const Hair *>(geom);
+              local_features |= (hair->curve_shape == CURVE_RIBBON) ? KERNEL_FEATURE_HAIR_RIBBON :
+                                                                      KERNEL_FEATURE_HAIR_THICK;
+              local_max_prim_count = max(local_max_prim_count, hair->num_segments());
+            }
+            else if (geom->is_pointcloud()) {
+              local_features |= KERNEL_FEATURE_POINTCLOUD;
+              local_max_prim_count = max(local_max_prim_count,
+                                         static_cast<PointCloud *>(geom)->num_points());
+            }
+            else if (geom->is_mesh()) {
+              local_max_prim_count = max(local_max_prim_count,
+                                         static_cast<Mesh *>(geom)->num_triangles());
+            }
+            else if (geom->is_light()) {
+              const Light *light = static_cast<const Light *>(object->get_geometry());
+              if (light->get_use_caustics()) {
+                local_caustics_light = true;
+              }
+            }
+            if (object->has_light_linking()) {
+              local_features |= KERNEL_FEATURE_LIGHT_LINKING;
+            }
+            if (object->has_shadow_linking()) {
+              local_features |= KERNEL_FEATURE_SHADOW_LINKING;
+            }
+          }
+
+          const thread_scoped_lock merge_lock(merge_mutex);
+          kernel_features |= local_features;
+          kernel_max_prim_count = max(kernel_max_prim_count, local_max_prim_count);
+          has_caustics_receiver |= local_caustics_receiver;
+          has_caustics_caster |= local_caustics_caster;
+          has_caustics_light |= local_caustics_light;
+        });
   }
 
   dscene.data.integrator.use_caustics = false;
@@ -647,7 +812,51 @@ void Scene::update_kernel_features()
 bool Scene::update(Progress &progress)
 {
   if (!need_update()) {
-    return false;
+    /* Nothing in the scene changed, but the interactive motion pass may still owe the device a
+     * settled motion history from the frame that was just rendered. Doing that through the manager
+     * pipeline costs a second full update per frame; here it is a single small upload.
+     *
+     * Except it is not a small upload for deformed positions - those live in the shared attribute
+     * tables, so settling them runs the geometry manager, measured at 5.2 ms. Paying that once
+     * after the scene comes to rest is fine. Paying it between two frames of playback is not, and
+     * that is what was happening: 143 settle passes against 146 real updates, each one settling a
+     * history the very next update overwrites anyway.
+     *
+     * So the settle waits for the scene to actually be at rest rather than merely between frames.
+     * The threshold is the accumulation depth: while a pose is still accumulating, the render
+     * scheduler zeroes motion for the trace itself, and any settle inside that window is undone by
+     * the next update. Once idle iterations exceed it, the scene has stopped and the history is
+     * settled for real - so a stopped viewport still converges to zero motion, just as before. */
+    constexpr int motion_history_idle_threshold = 4;
+    if (++idle_updates_ < motion_history_idle_threshold &&
+        (geometry_manager->need_motion_history_flush() ||
+         object_manager->need_motion_history_flush()))
+    {
+      return false;
+    }
+
+    if (geometry_manager->need_motion_history_flush()) {
+      /* Deformed positions live in the shared attribute tables, so settling them goes through the
+       * geometry manager - but under a flag that reaches nothing else: no object manager, no light
+       * tree, no scene BVH, since none of them describe motion steps. */
+      geometry_manager->tag_update(this, GeometryManager::MOTION_HISTORY_MODIFIED);
+    }
+    else if (object_manager->need_motion_history_flush()) {
+      if (object_manager->device_update_motion_history(&dscene, this)) {
+        return true;
+      }
+
+      /* The resident state was not in a shape the narrow path can patch. Fall through to a regular
+       * update rather than leaving stale motion on the device. */
+      object_manager->tag_update(this, ObjectManager::TRANSFORM_MODIFIED);
+    }
+    else {
+      return false;
+    }
+  }
+  else {
+    /* A real change from Blender: the scene is moving, so the idle run starts over. */
+    idle_updates_ = 0;
   }
 
   /* Upload scene data to the GPU. */
@@ -667,9 +876,25 @@ bool Scene::update_camera_resolution(Progress &progress, int width, int height)
   }
 
   if (integrator->get_use_pixel_jitter()) {
-    integrator->tag_use_pixel_jitter_modified();
-
-    integrator->device_update(device, &dscene, this);
+    /* This is what owns the pixel jitter in the viewport: it runs once per render work, so the
+     * free-running Halton state advances once per independent one-sample input, and the sequence
+     * keeps going across frames instead of restarting.
+     *
+     * Do not hoist this call out of the per-work path - viewport DLSS would silently degrade to a
+     * fixed sub-pixel offset and lose the sub-pixel coverage its upscaling depends on. The offline
+     * pipeline takes its jitter from `DLSSRenderController::plan_iteration()` instead, guarded by
+     * `RenderWork::dlss::jitter_from_iteration`. */
+    /* Asked before the tag, because the tag is what would make the answer yes. If nothing else
+     * about the integrator changed, only two numbers need writing, and the narrow path writes
+     * exactly those - see `device_update_pixel_jitter`. If something did change, the full update
+     * has to run anyway and it picks up the jitter along the way. */
+    if (integrator->is_modified()) {
+      integrator->tag_use_pixel_jitter_modified();
+      integrator->device_update(device, &dscene, this);
+    }
+    else {
+      integrator->device_update_pixel_jitter(&dscene);
+    }
     update_data = true;
   }
 
@@ -1083,7 +1308,12 @@ template<> void Scene::delete_node(Object *node)
   assert(node->get_owner() == this);
 
   uint flag = ObjectManager::OBJECT_REMOVED;
-  if (node->get_geometry()->has_volume) {
+  /* An object normally carries geometry, but nothing enforces it: the socket defaults to null and
+   * `sync_background_light` only assigns one on the branch that creates the geometry, so a new
+   * object paired with an existing background geometry leaves it unset. Asked rather than assumed,
+   * the way the rest of the code does it. */
+  const Geometry *geometry = node->get_geometry();
+  if (geometry && geometry->has_volume) {
     volume_manager->tag_update({node}, flag);
   }
 

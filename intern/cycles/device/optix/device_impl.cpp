@@ -108,6 +108,12 @@ OptiXDevice::~OptiXDevice()
   sbt_data.free();
   image_info.free();
   launch_params.free();
+  /* Freed here rather than left to the member's destructor: that runs after this body, by which
+   * point the CUDA context this allocation belongs to may already be gone. */
+  if (tlas_instances) {
+    tlas_instances->free();
+    tlas_instances.reset();
+  }
 
   /* Unload modules. */
   if (optix_module != nullptr) {
@@ -768,6 +774,14 @@ bool OptiXDevice::load_kernels(const uint kernel_features)
   }
 #  endif
 
+  /* Filling the froxel grid walks the medium along a camera column, which means tracing, and that
+   * is only allowed from a ray generation program here. It lives in the main module and in the
+   * intersection pipeline, so it is available whatever the scene asks of the shading one. */
+  group_descs[PG_RGEN_VOLUME_FROXEL_INJECT].kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+  group_descs[PG_RGEN_VOLUME_FROXEL_INJECT].raygen.module = optix_module;
+  group_descs[PG_RGEN_VOLUME_FROXEL_INJECT].raygen.entryFunctionName =
+      "__raygen__kernel_optix_volume_froxel_inject";
+
   optix_assert(optixProgramGroupCreate(
       context, group_descs, NUM_PROGRAM_GROUPS, &group_options, nullptr, nullptr, groups));
 
@@ -855,6 +869,7 @@ bool OptiXDevice::load_kernels(const uint kernel_features)
     pipeline_groups.push_back(groups[PG_RGEN_INTERSECT_SUBSURFACE]);
     pipeline_groups.push_back(groups[PG_RGEN_INTERSECT_VOLUME_STACK]);
     pipeline_groups.push_back(groups[PG_RGEN_INTERSECT_DEDICATED_LIGHT]);
+    pipeline_groups.push_back(groups[PG_RGEN_VOLUME_FROXEL_INJECT]);
     pipeline_groups.push_back(groups[PG_MISS]);
     pipeline_groups.push_back(groups[PG_HITD]);
     pipeline_groups.push_back(groups[PG_HITS]);
@@ -899,7 +914,8 @@ bool OptiXDevice::load_kernels(const uint kernel_features)
         std::max(stack_size[PG_RGEN_INTERSECT_CLOSEST].cssRG,
                  std::max(stack_size[PG_RGEN_INTERSECT_SHADOW].cssRG,
                           std::max(stack_size[PG_RGEN_INTERSECT_SUBSURFACE].cssRG,
-                                   stack_size[PG_RGEN_INTERSECT_VOLUME_STACK].cssRG))) +
+                                   std::max(stack_size[PG_RGEN_INTERSECT_VOLUME_STACK].cssRG,
+                                            stack_size[PG_RGEN_VOLUME_FROXEL_INJECT].cssRG)))) +
         link_options.maxTraceDepth * trace_css;
 
     optix_assert(optixPipelineSetStackSize(
@@ -1744,9 +1760,22 @@ void OptiXDevice::build_bvh(BVH *bvh, Progress &progress, bool refit)
       return;
     }
 
-    /* Fill instance descriptions. */
-    device_vector<OptixInstance> instances(this, "optix tlas instances", MEM_READ_ONLY);
-    instances.alloc(bvh->objects.size());
+    /* Fill instance descriptions. Kept across builds - see `tlas_instances`. Reallocated only when
+     * the object count changes, which on playback it never does. */
+    if (!tlas_instances) {
+      tlas_instances = make_unique<device_vector<OptixInstance>>(
+          this, "optix tlas instances", MEM_READ_ONLY);
+    }
+    device_vector<OptixInstance> &instances = *tlas_instances;
+    /* Whether the device copy can still be patched in place. A fresh allocation holds nothing to
+     * patch, and the range copy asserts on it. Taken before `alloc`, which is what would make the
+     * size match, and it covers the size on purpose: `device_vector::alloc` frees and reallocates
+     * on a size change without raising `need_realloc`. */
+    const bool instances_are_fresh = instances.need_realloc() ||
+                                     instances.size() != bvh->objects.size();
+    if (instances.size() != bvh->objects.size()) {
+      instances.alloc(bvh->objects.size());
+    }
 
     /* Calculate total motion transform size and allocate memory for them. */
     size_t motion_transform_offset = 0;
@@ -1921,9 +1950,22 @@ void OptiXDevice::build_bvh(BVH *bvh, Progress &progress, bool refit)
       }
     }
 
-    /* Upload instance descriptions. */
-    instances.resize(num_instances);
-    instances.copy_to_device();
+    /* Upload instance descriptions. Only the records actually used are sent; the buffer keeps its
+     * full allocation, and `numInstances` below is what bounds the build. `resize` is deliberately
+     * not used: on a size change it copies the whole array element by element and reallocates.
+     *
+     * A fresh allocation goes the full way once, and clearing the flag afterwards is what makes
+     * every later build a range copy. Without it the buffer kept `need_realloc` raised forever:
+     * a debug build asserted on the very first TLAS, and a release build silently fell back to
+     * copying the whole array every frame - so the range upload this buffer exists for never
+     * actually happened. */
+    if (instances_are_fresh) {
+      instances.copy_to_device();
+      instances.clear_modified();
+    }
+    else {
+      instances.copy_to_device_range(0, num_instances);
+    }
 
     /* Build top-level acceleration structure (TLAS) */
     OptixBuildInput build_input = {};

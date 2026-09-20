@@ -160,16 +160,69 @@ bool Session::ready_to_reset()
   return path_trace_->ready_to_reset();
 }
 
+int Session::draws_after_reset()
+{
+  return path_trace_->draws_after_reset();
+}
+
+void Session::request_denoiser_history_reset()
+{
+  path_trace_->request_denoiser_history_reset();
+}
+
 void Session::run_main_render_loop()
 {
   path_trace_->zero_display();
 
+  /* Where the session thread's wall clock goes. The measured stages of a playback frame - scene
+   * update, mesh copies, path trace, DLSS - add up to about half of the frame period, and the rest
+   * had never been attributed. This says how much of it is this thread waiting rather than working:
+   * `update` is the scene update under the scene mutex, `wait` is run_wait_for_work, `render` is
+   * the trace and display, `idle` is whatever is left between iterations. */
+  static const bool report_loop = getenv("CYCLES_DEBUG_VIEWPORT_PHASES") != nullptr;
+  double loop_update_ms = 0.0, loop_wait_ms = 0.0, loop_render_ms = 0.0;
+  int loop_iterations = 0;
+  double loop_window_start = time_dt();
+
   while (true) {
+    const double iteration_start = time_dt();
     RenderWork render_work = run_update_for_next_iteration();
+    loop_update_ms += (time_dt() - iteration_start) * 1000.0;
 
     const bool did_cancel = progress.get_cancel();
 
     if (!render_work) {
+      /* Everything scheduled for the current scene state is traced and posted. Published here
+       * rather than at `RenderScheduler::done()`, which fires while post-processing work with a
+       * display update is still outstanding.
+       *
+       * The extra `set_update()` is not redundant. The last working iteration already called it,
+       * but at that moment this flag was still false - it is raised microseconds later, on this
+       * turn of the loop. Without a second notification a draw that happened in between would be
+       * the last one, and nobody would ever publish the completion. */
+      if (!render_complete_.exchange(true, std::memory_order_acq_rel)) {
+        if (pose_started_ != 0.0) {
+          static const bool report_pose = getenv("CYCLES_DEBUG_POSE_TIME") != nullptr;
+          if (report_pose) {
+            /* What one accumulation actually costs, end to end, and how often one gets to finish
+             * at all. The second number matters more: if poses complete far less often than they
+             * start, then during playback the viewport is showing partly accumulated frames, which
+             * is exactly the complaint the timeline hold is meant to fix. The first number is what
+             * the hold timeout has to be derived from - too short silently disables the feature on
+             * normal frames, too long turns a stalled engine into a multi-second pause. */
+            static int completions = 0;
+            fprintf(stderr,
+                    "POSE_TIME ms=%.2f completions=%d starts=%d\n",
+                    (time_dt() - pose_started_) * 1000.0,
+                    ++completions,
+                    pose_starts_);
+            fflush(stderr);
+          }
+          pose_started_ = 0.0;
+        }
+        progress.set_update();
+      }
+
       if (LOG_IS_ON(LOG_LEVEL_INFO)) {
         if (did_cancel) {
           LOG_INFO << "Rendering was canceled.";
@@ -196,8 +249,13 @@ void Session::run_main_render_loop()
         break;
       }
     }
-    else if (run_wait_for_work(render_work)) {
-      continue;
+    else {
+      const double wait_start = time_dt();
+      const bool waited = run_wait_for_work(render_work);
+      loop_wait_ms += (time_dt() - wait_start) * 1000.0;
+      if (waited) {
+        continue;
+      }
     }
 
     /* Stop rendering if error happened during scene update or other step of preparing scene
@@ -207,6 +265,7 @@ void Session::run_main_render_loop()
       break;
     }
 
+    const double render_start = time_dt();
     {
       /* buffers mutex is locked entirely while rendering each
        * sample, and released/reacquired on each iteration to allow
@@ -226,6 +285,35 @@ void Session::run_main_render_loop()
       if (device->have_error()) {
         progress.set_error(device->error_message());
         break;
+      }
+    }
+
+    loop_render_ms += (time_dt() - render_start) * 1000.0;
+
+    if (report_loop) {
+      loop_iterations++;
+      const double window_ms = (time_dt() - loop_window_start) * 1000.0;
+      if (window_ms >= 2000.0) {
+        /* `idle` is the part of the window this thread was neither updating, waiting on the
+         * scheduler, nor rendering - lock contention with the sync on the main thread, and the
+         * handshake with the viewport draw. */
+        /* `lock` is the part of `update` that was spent waiting for the main thread rather than
+         * updating anything - it is included in `update`, not additional to it. */
+        fprintf(stderr,
+                "LOOP window=%.0f iterations=%d update=%.1f lock=%.1f wait=%.1f render=%.1f "
+                "idle=%.1f\n",
+                window_ms,
+                loop_iterations,
+                loop_update_ms,
+                loop_lock_wait_ms_,
+                loop_wait_ms,
+                loop_render_ms,
+                window_ms - loop_update_ms - loop_wait_ms - loop_render_ms);
+        fflush(stderr);
+        loop_update_ms = loop_wait_ms = loop_render_ms = 0.0;
+        loop_lock_wait_ms_ = 0.0;
+        loop_iterations = 0;
+        loop_window_start = time_dt();
       }
     }
 
@@ -312,13 +400,59 @@ RenderWork Session::run_update_for_next_iteration()
 {
   RenderWork render_work;
 
-  thread_scoped_lock scene_lock(scene->mutex);
+  /* The scene lock is taken inside what `LOOP update` measures, so that number has always been the
+   * sum of two unrelated things: updating the scene, and waiting for the main thread to finish its
+   * own `sync_data` and let go. Reading it as work led to opposite conclusions about where the
+   * freed milliseconds went, and neither could be checked. Separated here. */
+  static const bool report_lock_wait = getenv("CYCLES_DEBUG_VIEWPORT_PHASES") != nullptr;
+  const double lock_wait_started = report_lock_wait ? time_dt() : 0.0;
+
+  thread_scoped_timed_lock scene_lock(scene->mutex);
+
+  if (report_lock_wait) {
+    loop_lock_wait_ms_ += (time_dt() - lock_wait_started) * 1000.0;
+  }
+
+  /* Start of a new accumulation. A pending reset means the previous pose is abandoned - whatever
+   * it had accumulated describes a scene state that no longer exists - so the clock restarts here
+   * rather than only on the first pose. Iterations that continue an existing pose leave it alone.
+   *
+   * The first version only started the clock once, and the resulting measurement was the length of
+   * the whole run: during playback the flag never gets raised, because a new frame arrives before
+   * the scheduler runs out of work. That is a finding in its own right, not a broken timer. */
+  {
+    const thread_scoped_lock reset_lock(delayed_reset_.mutex);
+    if (delayed_reset_.do_reset || pose_started_ == 0.0) {
+      pose_started_ = time_dt();
+      pose_starts_++;
+    }
+  }
 
   /* Perform delayed reset if requested. */
   const bool reset_buffers = delayed_reset_buffer_params();
 
-  /* Update scene */
+  /* Update scene.
+   *
+   * Scene preparation is the one phase outside `PathTrace::render_pipeline`, and on a scene whose
+   * geometry is driven by modifiers it dominates the frame - so it is timed here, behind
+   * CYCLES_DEBUG_VIEWPORT_PHASES, to complete the per-frame attribution. The reason string tells a
+   * real depsgraph update apart from the interactive motion pass re-tagging itself. */
+  static const bool phases_enabled = getenv("CYCLES_DEBUG_VIEWPORT_PHASES") != nullptr;
+  const bool report_scene_update = phases_enabled && !params.background;
+  const string scene_update_reason = report_scene_update ? scene->update_reason() : string();
+  const double scene_update_start_time = time_dt();
   const bool reset_scene = update_scene(delayed_reset_.do_reset);
+  {
+    const double scene_update_ms = (time_dt() - scene_update_start_time) * 1000.0;
+    if (report_scene_update) {
+      fprintf(stderr,
+              "SCENE_UPDATE ms=%.2f reset=%d reason=%s\n",
+              scene_update_ms,
+              int(reset_scene),
+              scene_update_reason.c_str());
+      fflush(stderr);
+    }
+  }
 
   /* Update buffers for new parameters. After scene update which influences the passes used. */
   bool have_tiles = true;
@@ -357,6 +491,8 @@ RenderWork Session::run_update_for_next_iteration()
                                       params.use_sample_subset,
                                       params.sample_subset_offset,
                                       params.sample_subset_length);
+  render_scheduler_.set_interactive_sample_budget(
+      is_interacting_.load(std::memory_order_relaxed) ? params.interactive_samples : 0);
   render_scheduler_.set_time_limit(params.time_limit);
 
   while (have_tiles) {
@@ -372,6 +508,13 @@ RenderWork Session::run_update_for_next_iteration()
       render_scheduler_.reset_for_next_tile();
       switched_to_new_tile = true;
     }
+  }
+
+  /* A scene change normally resets the sample counter, so a viewport DLSS work with a non-zero
+   * iteration index means the scene did not move and the motion vectors must be zeroed. If a scene
+   * update does land on a later iteration, keep the real motion vectors for it. */
+  if (reset_scene && render_work.dlss.iteration > 0) {
+    render_work.dlss.zero_motion = false;
   }
 
   /* Evict unused image tiles periodically. */
@@ -491,9 +634,9 @@ bool Session::run_wait_for_work(const RenderWork &render_work)
   return no_work;
 }
 
-void Session::draw()
+bool Session::draw()
 {
-  path_trace_->draw();
+  return path_trace_->draw();
 }
 
 int2 Session::get_effective_tile_size() const
@@ -592,9 +735,57 @@ void Session::reset(const SessionParams &session_params, const BufferParams &buf
     delayed_reset_.session_params = session_params;
     delayed_reset_.buffer_params = buffer_params;
 
+    /* A new scene state invalidates the previous completion: whatever was accumulated describes a
+     * frame that no longer exists. Cleared here rather than where the reset is applied, so that no
+     * draw between the two can read a completion belonging to the old state. */
+    render_complete_.store(false, std::memory_order_release);
+
     scene->scene_updated_while_loading_kernels = true;
 
+    /* This is the main thread, and it is holding the scene lock: `BlenderSession::synchronize`
+     * takes it, runs `sync_data`, and calls this before letting go. So whatever `cancel()` waits
+     * for, the whole of Blender's UI waits for it too, with the lock held.
+     *
+     * A review pass found that under DLSS in the viewport `cancel()` cannot actually cancel
+     * anything: it only raises the request when the session is a background render or when more
+     * than one sample sits in the buffer, and the DLSS accessor is clamped to one. So it degrades
+     * into waiting out the render iteration that happens to be in flight. That is a hypothesis
+     * about a mechanism, worth two numbers before it is worth a change - how often the wait is
+     * non-zero, and how long it runs. A two-humped distribution would confirm it. */
+    static const bool report_cancel = getenv("CYCLES_DEBUG_VIEWPORT_PHASES") != nullptr;
+    const double cancel_started = report_cancel ? time_dt() : 0.0;
+
     path_trace_->cancel();
+
+    if (report_cancel) {
+      const double waited_ms = (time_dt() - cancel_started) * 1000.0;
+      cancel_calls_++;
+      cancel_total_ms_ += waited_ms;
+      if (waited_ms > 0.05) {
+        cancel_nonzero_++;
+      }
+      if (waited_ms > cancel_max_ms_) {
+        cancel_max_ms_ = waited_ms;
+      }
+      /* Coarse histogram in whole milliseconds, capped - enough to see two humps, and no allocation
+       * on the main thread while it holds the scene lock. */
+      const int bucket = std::min(int(waited_ms), int(std::size(cancel_histogram_)) - 1);
+      cancel_histogram_[bucket]++;
+
+      if (cancel_calls_ % 100 == 0) {
+        fprintf(stderr,
+                "CANCEL_WAIT calls=%d nonzero=%d mean=%.2f max=%.2f ms hist=",
+                cancel_calls_,
+                cancel_nonzero_,
+                cancel_total_ms_ / cancel_calls_,
+                cancel_max_ms_);
+        for (const int count : cancel_histogram_) {
+          fprintf(stderr, "%d,", count);
+        }
+        fprintf(stderr, "\n");
+        fflush(stderr);
+      }
+    }
   }
 
   pause_cond_.notify_all();
@@ -655,14 +846,54 @@ void Session::set_pause(bool pause)
   }
 }
 
-void Session::set_navigating(bool navigating)
+void Session::set_interaction_state(bool interacting)
 {
-  eviction_manager_.set_navigating(navigating);
+  eviction_manager_.set_navigating(interacting);
+
+  if (is_interacting_.exchange(interacting) == interacting) {
+    return;
+  }
+
+  /* The scheduler sleeps once the sample budget is reached, so leaving interaction has to wake it
+   * up for accumulation to resume. Entering interaction has to wake it too, otherwise a paused
+   * viewport would not drop to the reduced budget until something else nudged it. */
+  {
+    const thread_scoped_lock pause_lock(pause_mutex_);
+    new_work_added_ = true;
+  }
+
+  pause_cond_.notify_all();
+}
+
+void Session::set_volume_grid_hold(const bool hold)
+{
+  path_trace_->set_volume_grid_hold(hold);
+}
+
+void Session::set_interactive_samples(const int samples)
+{
+  if (samples == params.interactive_samples) {
+    return;
+  }
+
+  params.interactive_samples = samples;
+
+  {
+    const thread_scoped_lock pause_lock(pause_mutex_);
+    new_work_added_ = true;
+  }
+
+  pause_cond_.notify_all();
 }
 
 void Session::set_output_driver(unique_ptr<OutputDriver> driver)
 {
   path_trace_->set_output_driver(std::move(driver));
+}
+
+void Session::set_denoiser_external_images(const DenoiserExternalImages &images)
+{
+  path_trace_->set_denoiser_external_images(images);
 }
 
 void Session::set_display_driver(unique_ptr<DisplayDriver> driver)
@@ -803,8 +1034,14 @@ void Session::collect_statistics(RenderStats *render_stats)
   }
 }
 
+bool Session::dlss_runtime_failed() const
+{
+  return path_trace_->dlss_runtime_failed();
+}
+
 /* --------------------------------------------------------------------
- * Full-frame on-disk storage.
+ * Full-frame on-disk
+ * storage.
  */
 
 void Session::process_full_buffer_from_disk(string_view filename)

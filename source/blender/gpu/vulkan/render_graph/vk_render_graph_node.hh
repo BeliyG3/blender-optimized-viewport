@@ -27,6 +27,10 @@
 #include "nodes/vk_end_query_node.hh"
 #include "nodes/vk_end_rendering_node.hh"
 #include "nodes/vk_fill_buffer_node.hh"
+#if defined(WITH_DLSS_FRAME_GENERATION)
+#  include "nodes/vk_frame_generation_node.hh"
+#  include "nodes/vk_ray_reconstruction_node.hh"
+#endif
 #include "nodes/vk_reset_query_pool_node.hh"
 #include "nodes/vk_synchronization_node.hh"
 #include "nodes/vk_update_buffer_node.hh"
@@ -95,6 +99,10 @@ struct VKRenderGraphNode {
     VKEndQueryNode::Data end_query;
     VKEndRenderingNode::Data end_rendering;
     VKFillBufferNode::Data fill_buffer;
+#if defined(WITH_DLSS_FRAME_GENERATION)
+    VKFrameGenerationNode::Data frame_generation;
+    VKRayReconstructionNode::Data ray_reconstruction;
+#endif
     VKResetQueryPoolNode::Data reset_query_pool;
     VKSynchronizationNode::Data synchronization;
     VKUpdateBufferNode::Data update_buffer;
@@ -175,6 +183,18 @@ struct VKRenderGraphNode {
         return VKEndRenderingNode::pipeline_stage;
       case VKNodeType::FILL_BUFFER:
         return VKFillBufferNode::pipeline_stage;
+      case VKNodeType::FRAME_GENERATION:
+#if defined(WITH_DLSS_FRAME_GENERATION)
+        return VKFrameGenerationNode::pipeline_stage;
+#else
+        return VK_PIPELINE_STAGE_NONE;
+#endif
+      case VKNodeType::RAY_RECONSTRUCTION:
+#if defined(WITH_DLSS_FRAME_GENERATION)
+        return VKRayReconstructionNode::pipeline_stage;
+#else
+        return VK_PIPELINE_STAGE_NONE;
+#endif
       case VKNodeType::COPY_BUFFER:
         return VKCopyBufferNode::pipeline_stage;
       case VKNodeType::COPY_IMAGE:
@@ -253,6 +273,11 @@ struct VKRenderGraphNode {
         BUILD_COMMANDS(VKNodeType::END_QUERY, VKEndQueryNode, end_query)
         BUILD_COMMANDS(VKNodeType::END_RENDERING, VKEndRenderingNode, end_rendering)
         BUILD_COMMANDS(VKNodeType::FILL_BUFFER, VKFillBufferNode, fill_buffer)
+#if defined(WITH_DLSS_FRAME_GENERATION)
+        BUILD_COMMANDS(VKNodeType::FRAME_GENERATION, VKFrameGenerationNode, frame_generation)
+        BUILD_COMMANDS(
+            VKNodeType::RAY_RECONSTRUCTION, VKRayReconstructionNode, ray_reconstruction)
+#endif
         BUILD_COMMANDS(VKNodeType::UPDATE_BUFFER, VKUpdateBufferNode, update_buffer)
         BUILD_COMMANDS(VKNodeType::COPY_BUFFER, VKCopyBufferNode, copy_buffer)
         BUILD_COMMANDS_STORAGE(
@@ -302,6 +327,8 @@ struct VKRenderGraphNode {
       case VKNodeType::END_QUERY:
       case VKNodeType::END_RENDERING:
       case VKNodeType::FILL_BUFFER:
+      case VKNodeType::FRAME_GENERATION:
+      case VKNodeType::RAY_RECONSTRUCTION:
       case VKNodeType::COPY_BUFFER:
       case VKNodeType::COPY_IMAGE:
       case VKNodeType::COPY_IMAGE_TO_BUFFER:

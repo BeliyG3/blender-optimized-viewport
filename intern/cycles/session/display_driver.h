@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "integrator/denoiser_external_images.h"
 #include "util/half.h"
 #include "util/math_int2.h"
 #include "util/types.h"
@@ -111,10 +112,16 @@ class DisplayDriver {
     int2 full_size = make_int2(0, 0);
     int2 full_offset = make_int2(0, 0);
 
+    /* Changes only for a new scene/view state, not for static sampling updates. */
+    uint64_t render_revision = 0;
+
+    /* True between a render reset and the first complete texture update. */
+    bool texture_outdated = false;
+
     bool modified(const Params &other) const
     {
       return !(full_offset == other.full_offset && full_size == other.full_size &&
-               size == other.size);
+               size == other.size && render_revision == other.render_revision);
     }
   };
 
@@ -167,6 +174,60 @@ class DisplayDriver {
     return graphics_interop_buffer_;
   }
 
+  enum class FrameGenerationBuffer {
+    DEPTH,
+    MOTION,
+  };
+
+  /* Make - or keep - the images the Ray Reconstruction model reads, and describe them so that the
+   * renderer can write into them directly.
+   *
+   * The model of DLSS 4.5 does not run on the CUDA path of NGX, so it runs here instead, on images
+   * this side allocates. Returning false leaves the denoiser on its own path.
+   *
+   * Called from the render thread with this display's GPU context current. */
+  virtual bool dlss_denoiser_images_ensure(const int /*render_width*/,
+                                           const int /*render_height*/,
+                                           const int /*output_width*/,
+                                           const int /*output_height*/,
+                                           const int /*preset*/,
+                                           DenoiserExternalImages & /*r_images*/)
+  {
+    return false;
+  }
+
+  /* Run the model on whatever the renderer has just written into those images, and keep the result
+   * to be drawn. */
+  virtual bool dlss_denoiser_evaluate(const float /*jitter_x*/,
+                                      const float /*jitter_y*/,
+                                      const bool /*reset*/,
+                                      const float * /*world_to_view*/,
+                                      const float * /*view_to_clip*/)
+  {
+    return false;
+  }
+
+  /**
+   * Optional guide-buffer interop used only by DLSS Frame Generation. Linear depth and
+   * Cycles'
+   * four-channel motion are written on the render device without a CPU readback.
+ */
+  virtual bool frame_generation_interop_begin(const int /*width*/, const int /*height*/)
+  {
+    return false;
+  }
+
+  virtual void frame_generation_interop_update_buffer(const FrameGenerationBuffer /*buffer*/) {}
+
+  GraphicsInteropBuffer &frame_generation_interop_get_buffer(const FrameGenerationBuffer buffer)
+  {
+    frame_generation_interop_update_buffer(buffer);
+    return (buffer == FrameGenerationBuffer::DEPTH) ? frame_generation_depth_buffer_ :
+                                                      frame_generation_motion_buffer_;
+  }
+
+  virtual void frame_generation_interop_end(const bool /*success*/) {}
+
   /* (De)activate graphics context required for editing or deleting the graphics interop
    * object.
    *
@@ -189,6 +250,10 @@ class DisplayDriver {
    * Host application drawing the render buffer should use Session.draw(), which will
    * call this method. */
   virtual void draw(const Params &params) = 0;
+
+ protected:
+  GraphicsInteropBuffer frame_generation_depth_buffer_;
+  GraphicsInteropBuffer frame_generation_motion_buffer_;
 };
 
 CCL_NAMESPACE_END

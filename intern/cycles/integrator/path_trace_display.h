@@ -118,6 +118,27 @@ class PathTraceDisplay {
   GraphicsInteropDevice graphics_interop_get_device();
   GraphicsInteropBuffer &graphics_interop_get_buffer();
 
+  bool frame_generation_interop_begin(int width, int height);
+  GraphicsInteropBuffer &frame_generation_interop_get_buffer(
+      DisplayDriver::FrameGenerationBuffer buffer);
+  void frame_generation_interop_end(bool success);
+
+  /* The denoiser of DLSS 4.5, which runs on the display side because it does not run on the CUDA
+   * path of NGX. The first call makes the images the renderer writes into; the second runs the
+   * model on them. Both need this display's GPU context, so both are made between
+   * `graphics_interop_activate` and `graphics_interop_deactivate`. */
+  bool dlss_denoiser_images_ensure(int render_width,
+                                   int render_height,
+                                   int output_width,
+                                   int output_height,
+                                   int preset,
+                                   DenoiserExternalImages &r_images);
+  bool dlss_denoiser_evaluate(float jitter_x,
+                              float jitter_y,
+                              bool reset,
+                              const float *world_to_view,
+                              const float *view_to_clip);
+
   /* (De)activate GPU display for graphics interoperability outside of regular display update
    * routines. */
   void graphics_interop_activate();
@@ -155,6 +176,7 @@ class PathTraceDisplay {
   /* Current display parameters */
   thread_mutex mutex_;
   DisplayDriver::Params params_;
+  uint64_t render_revision_ = 0;
 
   /* Mark texture as its content has been updated.
    * Used from places which knows that the texture content has been brought up-to-date, so that the

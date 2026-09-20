@@ -22,6 +22,7 @@
 #include "BLI_listbase.h"
 #include "BLI_math_matrix.h"
 #include "BLI_math_vector.h"
+#include "BLI_time.h"
 #include "BLI_utildefines.h"
 
 #include "DNA_object_types.h"
@@ -147,7 +148,8 @@ bool deg_iterator_duplis_step(DEGObjectIterData *data)
                                             data->eval_mode,
                                             true,
                                             &data->temp_dupli_object,
-                                            &data->temp_dupli_object_runtime))
+                                            &data->temp_dupli_object_runtime,
+                                            data->need_inverse_matrix))
     {
       data->next_object = &data->temp_dupli_object;
       return true;
@@ -491,11 +493,42 @@ bool evil::DEG_iterator_temp_object_from_dupli(const Object *dupli_parent,
                                                eEvaluationMode eval_mode,
                                                bool do_matrix_setup,
                                                Object *r_temp_object,
-                                               bke::ObjectRuntime *r_temp_runtime)
+                                               bke::ObjectRuntime *r_temp_runtime,
+                                               bool need_inverse_matrix)
 {
+  /* How much of the instance walk is this function, and how much of that is the two copies above
+   * the matrix setup.
+   *
+   * Worth measuring before touching: on a Geometry Nodes scene this runs tens of thousands of
+   * times per frame, entirely inside the Cycles scene lock, and the copies are the part that
+   * scales with the number of instances rather than with what changed. But the estimate of what
+   * they cost has never been checked against a clock, and estimates in this project have a poor
+   * record. Printed per batch of instances so the per-call cost stays below timer resolution. */
+  static const bool report_copy = getenv("BLENDER_DEBUG_DUPLI_COPY") != nullptr;
+  static double copy_seconds = 0.0;
+  static double total_seconds = 0.0;
+  static int calls = 0;
+  static int repeats = 0;
+  static const Object *last_source = nullptr;
+  static const ID *last_source_data = nullptr;
+
+  const double call_start = report_copy ? BLI_time_now_seconds() : 0.0;
+
   *r_temp_object = dna::shallow_copy(*dupli->ob);
   r_temp_object->runtime = r_temp_runtime;
   *r_temp_object->runtime = *dupli->ob->runtime;
+
+  if (report_copy) {
+    copy_seconds += BLI_time_now_seconds() - call_start;
+    /* Whether the previous instance came from the same source. If it usually did, a cache in the
+     * iterator state can skip the copies; if it did not, there is nothing to skip and the idea
+     * dies here rather than after a hundred lines in the depsgraph. */
+    if (last_source == dupli->ob && last_source_data == dupli->ob_data) {
+      repeats++;
+    }
+    last_source = dupli->ob;
+    last_source_data = static_cast<const ID *>(dupli->ob_data);
+  }
 
   r_temp_object->base_flag = dupli_parent->base_flag | BASE_FROM_DUPLI;
   r_temp_object->base_local_view_bits = dupli_parent->base_local_view_bits;
@@ -518,17 +551,36 @@ bool evil::DEG_iterator_temp_object_from_dupli(const Object *dupli_parent,
   }
 
   if (do_matrix_setup) {
-    /* This could be avoided by refactoring make_dupli() in order to track all negative scaling
-     * recursively. */
-    bool is_neg_scale = is_negative_m4(dupli->mat);
-    SET_FLAG_FROM_TEST(r_temp_object->transflag, is_neg_scale, OB_NEG_SCALE);
-
     copy_m4_m4(r_temp_object->runtime->object_to_world.ptr(), dupli->mat);
-    invert_m4_m4(r_temp_object->runtime->world_to_object.ptr(),
-                 r_temp_object->object_to_world().ptr());
+
+    /* The inverse and the negative-scale flag are separate: a consumer that only places geometry
+     * needs neither, and inverting a 4x4 per instance is real work when Geometry Nodes turn a few
+     * hundred objects into tens of thousands of them. */
+    if (need_inverse_matrix) {
+      /* This could be avoided by refactoring make_dupli() in order to track all negative scaling
+       * recursively. */
+      bool is_neg_scale = is_negative_m4(dupli->mat);
+      SET_FLAG_FROM_TEST(r_temp_object->transflag, is_neg_scale, OB_NEG_SCALE);
+
+      invert_m4_m4(r_temp_object->runtime->world_to_object.ptr(),
+                   r_temp_object->object_to_world().ptr());
+    }
   }
 
   BLI_assert(deg::deg_validate_eval_copy_datablock(&r_temp_object->id));
+
+  if (report_copy) {
+    total_seconds += BLI_time_now_seconds() - call_start;
+    if (++calls % 100000 == 0) {
+      fprintf(stderr,
+              "DUPLI_COPY calls=%d copy_ms=%.2f total_ms=%.2f repeat_share=%.3f\n",
+              calls,
+              copy_seconds * 1000.0,
+              total_seconds * 1000.0,
+              double(repeats) / double(calls));
+      fflush(stderr);
+    }
+  }
 
   return true;
 }

@@ -75,6 +75,8 @@ set(SRC
   intern/gpu_context.cc
   intern/gpu_debug.cc
   intern/gpu_framebuffer.cc
+  intern/gpu_dlss_ray_reconstruction.cc
+  intern/gpu_frame_generation.cc
   intern/gpu_immediate.cc
   intern/gpu_immediate_util.cc
   intern/gpu_index_buffer.cc
@@ -138,6 +140,8 @@ set(SRC
   GPU_debug.hh
   GPU_format.hh
   GPU_framebuffer.hh
+  GPU_dlss_ray_reconstruction.hh
+  GPU_frame_generation.hh
   GPU_immediate.hh
   GPU_immediate_util.hh
   GPU_index_buffer.hh
@@ -471,6 +475,25 @@ if(WITH_VULKAN_BACKEND)
   )
 
   add_definitions(-DWITH_VULKAN_BACKEND)
+endif()
+
+if(WITH_DLSS_FRAME_GENERATION)
+  find_package(DLSS REQUIRED)
+  list(APPEND SRC
+    vulkan/vk_dlss_ray_reconstruction.cc
+    vulkan/vk_frame_generation.cc
+    vulkan/vk_ngx_runtime.cc
+
+    vulkan/vk_dlss_ray_reconstruction.hh
+    vulkan/vk_frame_generation.hh
+    vulkan/vk_ngx_runtime.hh
+    vulkan/render_graph/nodes/vk_frame_generation_node.hh
+    vulkan/render_graph/nodes/vk_ray_reconstruction_node.hh
+  )
+  list(APPEND INC_SYS
+    ${DLSS_INCLUDE_DIR}
+  )
+  add_definitions(-DWITH_DLSS_FRAME_GENERATION)
 endif()
 
 set(GLSL_SRC
@@ -811,6 +834,14 @@ set(VULKAN_BACKEND_GLSL_SRC
   vulkan/shaders/vk_backbuffer_blit_comp.glsl
 )
 
+if(WITH_DLSS_FRAME_GENERATION)
+  list(APPEND VULKAN_BACKEND_GLSL_SRC
+    vulkan/shaders/vk_frame_generation_preprocess_infos.hh
+
+    vulkan/shaders/vk_frame_generation_preprocess_comp.glsl
+  )
+endif()
+
 if(WITH_GTESTS)
   if(WITH_GPU_BACKEND_TESTS)
     list(APPEND GLSL_SRC ${GLSL_TEST_SRC})
@@ -942,6 +973,7 @@ if(WITH_GTESTS)
     list(APPEND TEST_SRC
       tests/buffer_texture_test.cc
       tests/compute_test.cc
+      tests/frame_generation_test.cc
       tests/framebuffer_test.cc
       tests/immediate_test.cc
       tests/index_buffer_test.cc

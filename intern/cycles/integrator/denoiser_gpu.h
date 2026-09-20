@@ -47,20 +47,22 @@ class DenoiserGPU : public Denoiser {
 
   /* Run corresponding filter kernels, preparing data for the denoiser or copying data from the
    * denoiser result to the render buffer. */
-  bool denoise_filter_color_preprocess(const DenoiseContext &context, const DenoisePass &pass);
-  bool denoise_filter_color_postprocess(const DenoiseContext &context, const DenoisePass &pass);
+  virtual bool denoise_filter_color_preprocess(const DenoiseContext &context,
+                                               const DenoisePass &pass);
+  virtual bool denoise_filter_color_postprocess(const DenoiseContext &context,
+                                                const DenoisePass &pass);
   bool denoise_filter_color_flip_y(const DenoiseContext &context,
                                    const BufferParams &buffer_params,
                                    const DenoisePass &pass);
   bool denoise_filter_guiding_flip_y(const DenoiseContext &context);
-  bool denoise_filter_guiding_set_fake_albedo(const DenoiseContext &context);
+  bool denoise_filter_guiding_set_fake_albedo(DenoiseContext &context);
 
   /* Read guiding passes from the render buffers, preprocess them in a way which is expected by
    * the GPU denoiser and store in the guiding passes memory within the given context.
    *
    * Pre-processing of the guiding passes is to only happen once per context lifetime. DO not
    * preprocess them for every pass which is being denoised. */
-  bool denoise_filter_guiding_preprocess(const DenoiseContext &context);
+  virtual bool denoise_filter_guiding_preprocess(DenoiseContext &context);
 
   bool denoise_pass(DenoiseContext &context, PassType pass_type);
 
@@ -144,6 +146,10 @@ class DenoiserGPU : public Denoiser {
     int pass_denoising_albedo = PASS_UNUSED;
     int pass_denoising_normal = PASS_UNUSED;
     int pass_motion = PASS_UNUSED;
+    /* `PASS_MOTION` is a weighted pass: `film_get_pass_pixel_motion` divides it by this, not by the
+     * sample count, because only the samples that reached a surface, the background or a volume
+     * wrote a vector. */
+    int pass_motion_weight = PASS_UNUSED;
 
     /* For passes which don't need albedo channel for denoising we replace the actual albedo with
      * the (0.5, 0.5, 0.5). This flag indicates that the real albedo pass has been replaced with

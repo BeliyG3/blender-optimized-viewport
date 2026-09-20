@@ -406,13 +406,58 @@ ccl_device_inline void film_write_emission_or_background_pass(
   const uint32_t path_flag = INTEGRATOR_STATE(state, path, flag);
   int pass_offset = PASS_UNUSED;
 
-  /* Denoising albedo. */
+  /* Denoising albedo.
+   *
+   * What lands here is radiance, not reflectance: for an emitter it is its own brightness, which
+   * on a lava shader runs into the hundreds. A denoiser divides the colour by this pass, filters,
+   * and multiplies back, so the demodulated signal is illumination everywhere except on emitters,
+   * where it is the emission itself. Across the silhouette of a dark object in front of a bright
+   * emitter the two differ by more than an order of magnitude, and any spatial filter drags the
+   * emitter across the edge - which is what the low-frequency error map shows as a uniformly
+   * brightened tank against clean fog.
+   *
+   * Bit 2 of CYCLES_DENOISING_EMISSIVE_FEATURES leaves the pass alone for emission and background,
+   * so the hint stays reflectance and stays comparable across a silhouette. Default keeps the
+   * upstream behaviour. */
 #  ifdef __DENOISING_FEATURES__
-  if (path_flag & PATH_RAY_DENOISING_FEATURES) {
+  if ((path_flag & PATH_RAY_DENOISING_FEATURES) &&
+      (kernel_data.integrator.denoising_emissive_features & 4) == 0)
+  {
     if (kernel_data.film.pass_denoising_albedo != PASS_UNUSED) {
       const Spectrum denoising_feature_throughput = INTEGRATOR_STATE(
           state, path, denoising_feature_throughput);
-      const Spectrum denoising_albedo = denoising_feature_throughput * contribution;
+      Spectrum denoising_albedo = denoising_feature_throughput * contribution;
+
+      /* Bit 3: compress this contribution alone, here at the write, with a curve that is the
+       * identity below one and monotone above it.
+       *
+       * The pass is meant to hold reflectance, and reflectance is at most one. Emission arrives in
+       * the hundreds, and the preprocess brings it into range by dividing by the peak - which maps
+       * every value above one onto the same fully saturated hue, so an emitter at 300 and a glow at
+       * 2 become indistinguishable and reconstruction loses the pattern rather than the brightness.
+       * Measured on a settled frame: bright pixels over the lava fall from 42% of the region to
+       * 0.12%.
+       *
+       * Compressing the whole pass instead was measured at nearly four times worse, because that
+       * curve also moved values that were already valid reflectance - 0.1 became 0.30, and every
+       * ordinary surface was demodulated against a hint three times too bright. Scaling by
+       * luminance leaves those untouched: below one the factor is one.
+       *
+       * The floor follows NVIDIA's own path tracing sample, which keeps its emissive guide away
+       * from zero so the network is never asked to divide by nothing. */
+      if ((kernel_data.integrator.denoising_emissive_features & 8) != 0) {
+        const float luminance = average(fabs(denoising_albedo));
+        if (luminance > 0.0f) {
+          /* Reinhard on luminance, so hue is untouched and the result always lands below one -
+           * which keeps the preprocess from dividing by the peak and flattening it again. An
+           * emitter at 2 arrives as 0.67, one at 300 as 0.997: still ordered, no longer identical.
+           * Ordinary reflectance never passes through here; it is written by
+           * `film_write_denoising_features_surface`, which is why this can be aggressive. */
+          const float compressed = fmaxf(luminance / (1.0f + luminance), 0.05f);
+          denoising_albedo *= compressed / luminance;
+        }
+      }
+
       film_write_pass_spectrum(buffer + kernel_data.film.pass_denoising_albedo, denoising_albedo);
     }
   }

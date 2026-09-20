@@ -96,6 +96,19 @@ if(WITH_VULKAN_BACKEND)
   add_definitions(-DWITH_VULKAN_BACKEND)
 endif()
 
+if(WITH_DLSS_FRAME_GENERATION)
+  find_package(DLSS REQUIRED)
+  list(APPEND SRC
+    intern/GHOST_NGXVK.cc
+
+    intern/GHOST_NGXVK.hh
+  )
+  list(APPEND INC_SYS
+    ${DLSS_INCLUDE_DIR}
+  )
+  add_definitions(-DWITH_DLSS_FRAME_GENERATION)
+endif()
+
 if(WITH_GHOST_DEBUG)
   list(APPEND SRC
     intern/GHOST_EventPrinter.cc

@@ -197,6 +197,8 @@ set(SRC_KERNEL_INTEGRATOR_HEADERS
   integrator/shade_shadow.h
   integrator/shade_surface.h
   integrator/shade_volume.h
+  integrator/volume_froxel.h
+  integrator/volume_octree.h
   integrator/shade_dedicated_light.h
   integrator/shadow_catcher.h
   integrator/shadow_linking.h

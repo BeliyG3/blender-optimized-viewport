@@ -23,6 +23,10 @@ void PathTraceDisplay::reset(const BufferParams &buffer_params, const bool reset
                                   buffer_params.full_y + buffer_params.window_y);
   params_.full_size = make_int2(buffer_params.full_width, buffer_params.full_height);
   params_.size = make_int2(buffer_params.window_width, buffer_params.window_height);
+  if (reset_rendering) {
+    ++render_revision_;
+  }
+  params_.render_revision = render_revision_;
 
   texture_state_.is_outdated = true;
 
@@ -218,6 +222,45 @@ GraphicsInteropBuffer &PathTraceDisplay::graphics_interop_get_buffer()
   return interop_buffer;
 }
 
+bool PathTraceDisplay::frame_generation_interop_begin(const int width, const int height)
+{
+  DCHECK(update_state_.is_active);
+  return update_state_.is_active && driver_->frame_generation_interop_begin(width, height);
+}
+
+GraphicsInteropBuffer &PathTraceDisplay::frame_generation_interop_get_buffer(
+    const DisplayDriver::FrameGenerationBuffer buffer)
+{
+  DCHECK(update_state_.is_active);
+  return driver_->frame_generation_interop_get_buffer(buffer);
+}
+
+void PathTraceDisplay::frame_generation_interop_end(const bool success)
+{
+  DCHECK(update_state_.is_active);
+  driver_->frame_generation_interop_end(success);
+}
+
+bool PathTraceDisplay::dlss_denoiser_images_ensure(const int render_width,
+                                                  const int render_height,
+                                                  const int output_width,
+                                                  const int output_height,
+                                                  const int preset,
+                                                  DenoiserExternalImages &r_images)
+{
+  return driver_->dlss_denoiser_images_ensure(
+      render_width, render_height, output_width, output_height, preset, r_images);
+}
+
+bool PathTraceDisplay::dlss_denoiser_evaluate(const float jitter_x,
+                                              const float jitter_y,
+                                              const bool reset,
+                                              const float *world_to_view,
+                                              const float *view_to_clip)
+{
+  return driver_->dlss_denoiser_evaluate(jitter_x, jitter_y, reset, world_to_view, view_to_clip);
+}
+
 void PathTraceDisplay::graphics_interop_activate()
 {
   driver_->graphics_interop_activate();
@@ -250,6 +293,7 @@ bool PathTraceDisplay::draw()
     params = params_;
     is_outdated = texture_state_.is_outdated;
   }
+  params.texture_outdated = is_outdated;
 
   driver_->draw(params);
 

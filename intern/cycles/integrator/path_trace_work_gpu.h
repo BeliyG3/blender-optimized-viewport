@@ -49,6 +49,7 @@ class PathTraceWorkGPU : public PathTraceWork {
   int adaptive_sampling_converge_filter_count_active(const float threshold, bool reset) override;
   void cryptomatte_postproces() override;
   void denoise_volume_guiding_buffers() override;
+  void build_volume_froxel_grid() override;
 
  protected:
   void alloc_integrator_soa();
@@ -98,6 +99,7 @@ class PathTraceWorkGPU : public PathTraceWork {
   bool copy_to_display_interop(PathTraceDisplay *display,
                                PassMode pass_mode,
                                const int num_samples);
+  bool copy_frame_generation_guides_interop(PathTraceDisplay *display, const int num_samples);
 
   /* Synchronously run film conversion kernel and store display result in the given destination. */
   void get_render_tile_film_pixels(const PassAccessor::Destination &destination,
@@ -128,6 +130,13 @@ class PathTraceWorkGPU : public PathTraceWork {
 
   /* Integrate state for paths. */
   IntegratorStateGPU integrator_state_gpu_;
+  /* Whether the device side copy of `integrator_state_gpu_` needs refreshing. Set by
+   * `alloc_work_memory()`, which is also what runs after a kernel module reload. */
+  bool integrator_state_gpu_dirty_ = true;
+
+  /* Wavefront host round-trip diagnostics, see CYCLES_DEBUG_WAVEFRONT_STALLS in the source. */
+  int wavefront_round_trips_ = 0;
+  double wavefront_stall_seconds_ = 0.0;
   /* SoA arrays for integrator state. */
   vector<unique_ptr<device_memory>> integrator_state_soa_;
   uint integrator_state_soa_kernel_features_;
@@ -155,6 +164,8 @@ class PathTraceWorkGPU : public PathTraceWork {
   device_vector<half4> display_rgba_half_;
 
   unique_ptr<DeviceGraphicsInterop> device_graphics_interop_;
+  unique_ptr<DeviceGraphicsInterop> device_frame_generation_depth_interop_;
+  unique_ptr<DeviceGraphicsInterop> device_frame_generation_motion_interop_;
 
   /* Cached result of device->should_use_graphics_interop(). */
   bool interop_use_checked_ = false;

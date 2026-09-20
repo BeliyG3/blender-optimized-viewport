@@ -288,6 +288,7 @@ class device_memory {
   /* Device memory allocation and copying. */
   void device_alloc();
   void device_copy_to();
+  void device_copy_to_range(const size_t offset_bytes, const size_t size_bytes);
   void device_move_to_host();
   void device_copy_from(const size_t y, const size_t w, size_t h, const size_t elem);
   void device_copy_merged_bitmap_from(const size_t y, const size_t w, size_t h);
@@ -562,6 +563,23 @@ template<typename T> class device_vector : public device_memory {
     }
 
     copy_to_device();
+  }
+
+  /* Upload only elements [offset, offset + count), leaving the rest of the device copy in place.
+   *
+   * For scene-wide arrays that hold every geometry end to end this is the difference between
+   * re-uploading the whole scene because one mesh changed and uploading just that mesh. Only valid
+   * when the allocation was not resized this update - check `need_realloc()` first. */
+  void copy_to_device_range(const size_t offset, const size_t count)
+  {
+    if (count == 0 || data_size == 0) {
+      return;
+    }
+
+    assert(offset + count <= data_size);
+    assert(!need_realloc_);
+
+    device_copy_to_range(offset * sizeof(T), count * sizeof(T));
   }
 
   void clear_modified()

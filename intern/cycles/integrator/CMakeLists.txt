@@ -12,16 +12,20 @@ set(INC_SYS
 set(SRC
   adaptive_sampling.cpp
   denoiser.cpp
+  denoiser_dlss.cpp
   denoiser_gpu.cpp
   denoiser_oidn.cpp
   denoiser_oidn_base.cpp
   denoiser_oidn_gpu.cpp
   denoiser_optix.cpp
+  dlss_controller.cpp
+  frame_generation_scheduler.cpp
   path_trace.cpp
   tile.cpp
   pass_accessor.cpp
   pass_accessor_cpu.cpp
   pass_accessor_gpu.cpp
+  pass_resampler.cpp
   path_trace_display.cpp
   path_trace_tile.cpp
   path_trace_work.cpp
@@ -36,17 +40,21 @@ set(SRC
 set(SRC_HEADERS
   adaptive_sampling.h
   denoiser.h
+  denoiser_dlss.h
   denoiser_gpu.h
   denoiser_oidn.h
   denoiser_oidn_base.h
   denoiser_oidn_gpu.h
   denoiser_optix.h
+  dlss_controller.h
+  frame_generation_scheduler.h
   guiding.h
   path_trace.h
   tile.h
   pass_accessor.h
   pass_accessor_cpu.h
   pass_accessor_gpu.h
+  pass_resampler.h
   path_trace_display.h
   path_trace_tile.h
   path_trace_work.h
@@ -69,6 +77,12 @@ set(LIB
   PRIVATE bf::dependencies::optional::openimagedenoise
   PRIVATE bf::dependencies::optional::openpgl
 )
+
+if(WITH_DLSS)
+  list(APPEND INC_SYS
+    ${DLSS_INCLUDE_DIR}
+  )
+endif()
 
 include_directories(${INC})
 include_directories(SYSTEM ${INC_SYS})

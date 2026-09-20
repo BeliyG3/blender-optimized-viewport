@@ -45,6 +45,8 @@
 #include "kernel/film/adaptive_sampling.h"
 #include "kernel/film/volume_guiding_denoise.h"
 
+#include "kernel/integrator/volume_froxel.h"
+
 #ifdef __KERNEL_METAL__
 #  include "kernel/device/metal/context_end.h"
 #elif defined(__KERNEL_ONEAPI__)
@@ -1361,6 +1363,21 @@ ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
   if (x < sw) {
     ccl_gpu_kernel_call(
         volume_guiding_filter_y(nullptr, render_buffer, sx + x, sy, sy + sh, offset, stride));
+  }
+}
+ccl_gpu_kernel_postfix
+
+/* --------------------------------------------------------------------
+ * Camera-aligned volume grid.
+ */
+
+ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
+    ccl_gpu_kernel_signature(volume_froxel_inject, const int num_columns)
+{
+  const int column_index = ccl_gpu_global_id_x();
+
+  if (column_index < num_columns) {
+    ccl_gpu_kernel_call(volume_froxel_inject(nullptr, column_index));
   }
 }
 ccl_gpu_kernel_postfix

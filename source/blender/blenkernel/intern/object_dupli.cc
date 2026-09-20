@@ -90,6 +90,13 @@ struct DupliContext {
 
   /** Root parent object at the scene level. */
   Object *root_object;
+  /**
+   * `BLI_hash_int(BLI_hash_string(root_object->id.name + 2))`, which every instance below the root
+   * mixes into its random id. The root does not change for the length of a #object_duplilist call,
+   * so neither does this - but it used to be recomputed per instance, which on a scene of 33858
+   * instances is 33858 hashes of the same string. Sub-contexts inherit it by plain copy.
+   */
+  uint root_object_hash;
   /** Immediate parent object in the context. */
   Object *object;
   float space_mat[4][4];
@@ -158,6 +165,7 @@ static void init_context(DupliContext *r_ctx,
   r_ctx->collection = nullptr;
 
   r_ctx->root_object = ob;
+  r_ctx->root_object_hash = BLI_hash_int(BLI_hash_string(ob->id.name + 2));
   r_ctx->object = ob;
   r_ctx->obedit = OBEDIT_FROM_OBACT(ob);
   r_ctx->instance_stack = &instance_stack;
@@ -328,7 +336,8 @@ static DupliObject *make_dupli(const DupliContext *ctx,
   }
 
   if (ctx->root_object != ob) {
-    dob->random_id ^= BLI_hash_int(BLI_hash_string(ctx->root_object->id.name + 2));
+    /* Same value as hashing the name here would give; it is computed once in #init_context. */
+    dob->random_id ^= ctx->root_object_hash;
   }
 
   return dob;

@@ -30,7 +30,11 @@ struct DeviceKernelArguments {
     HIPRT_GLOBAL_STACK,
   };
 
-  static const int MAX_ARGS = 19;
+  /* The DLSS guiding preprocess already passes 24 arguments, one past the previous limit of 23:
+   * `add` asserts in a debug build and writes past the end of these three arrays in a release one,
+   * where the overflow lands in the next member and corrupts it silently. Raising the cap costs a
+   * few dozen bytes on a stack-allocated struct. */
+  static const int MAX_ARGS = 32;
   Type types[MAX_ARGS];
   void *values[MAX_ARGS];
   size_t sizes[MAX_ARGS];
@@ -150,6 +154,18 @@ class DeviceQueue {
   /* Copy memory to/from device as part of the command queue, to ensure
    * operations are done in order without having to synchronize. */
   virtual void zero_to_device(device_memory &mem) = 0;
+
+  /* Zero only the leading `num_bytes` of the allocation.
+   *
+   * Used when the render buffer is allocated at an upscaling denoiser's output resolution while
+   * the path tracer only writes the smaller input-resolution prefix of it. Backends without a
+   * partial implementation fall back to zeroing everything, which is always correct. */
+  virtual void zero_to_device_prefix(device_memory &mem, const size_t num_bytes)
+  {
+    (void)num_bytes;
+    zero_to_device(mem);
+  }
+
   virtual void copy_to_device(device_memory &mem) = 0;
   virtual void copy_from_device(device_memory &mem) = 0;
   virtual void *copy_from_device_synchronized(device_memory &mem, vector<uint8_t> &storage) = 0;

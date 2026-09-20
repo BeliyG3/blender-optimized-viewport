@@ -128,6 +128,22 @@ class Integrator : public Node {
   NODE_SOCKET_API(bool, denoise_use_gpu);
   NODE_SOCKET_API(DenoiserQuality, denoiser_quality);
   NODE_SOCKET_API(float, denoiser_upscale_factor);
+  NODE_SOCKET_API(bool, dlss_offline);
+  NODE_SOCKET_API(bool, dlss_animation);
+  NODE_SOCKET_API(bool, dlss_reset_history);
+  NODE_SOCKET_API(bool, dlss_zero_motion_first);
+  NODE_SOCKET_API(int, dlss_iterations);
+  /* Which Ray Reconstruction model to request; a driver profile may override it anyway. */
+  NODE_SOCKET_API(int, dlss_preset);
+
+  /* Read volumes from a camera-aligned grid in the viewport instead of tracing them. Approximate,
+   * but free of variance, which is what lets an object inside dense fog be seen while the view
+   * moves. `approximate_volumes_distance` of zero takes the reach from the scene's volume bounds.
+   */
+  NODE_SOCKET_API(bool, use_approximate_volumes);
+  NODE_SOCKET_API(bool, approximate_volumes_always);
+  NODE_SOCKET_API(float, approximate_volumes_distance);
+  NODE_SOCKET_API(int, approximate_volumes_light_samples);
 
   enum : uint32_t {
     AO_PASS_MODIFIED = (1 << 0),
@@ -145,6 +161,19 @@ class Integrator : public Node {
   ~Integrator() override;
 
   void device_update(Device *device, DeviceScene *dscene, Scene *scene);
+
+  /* Advance the pixel jitter and nothing else.
+   *
+   * The viewport asks for a new jitter once per render work, which under DLSS is every accumulation
+   * iteration - about fifty times a second. Getting it through `device_update` meant walking every
+   * shader in the scene to recompute `transparent_shadows`, re-reading the guiding parameters, and
+   * freeing and rewriting the whole kernel integrator struct, all to change two numbers, and all
+   * while the session thread holds the scene lock that the main thread is waiting on.
+   *
+   * Writes the same two fields the full path writes, in the same order, from the same sequence, so
+   * the jitter and the seed are bit for bit what they would have been. */
+  void device_update_pixel_jitter(DeviceScene *dscene);
+
   void device_free(Device *device, DeviceScene *dscene, bool force_free = false);
 
   void tag_update(Scene *scene, const uint32_t flag);

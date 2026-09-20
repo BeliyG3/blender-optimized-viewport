@@ -7,6 +7,10 @@
 #include "device/cpu/device.h"
 #include "device/device.h"
 
+#include "integrator/dlss_controller.h"
+#ifdef WITH_DLSS
+#  include "integrator/denoiser_dlss.h"
+#endif
 #include "integrator/pass_accessor.h"
 #include "integrator/path_trace_display.h"
 #include "integrator/path_trace_tile.h"
@@ -122,6 +126,8 @@ void PathTrace::reset(const BufferParams &full_params,
                       const BufferParams &big_tile_params,
                       const bool reset_rendering)
 {
+  dlss_runtime_failed_ = false;
+
   if (big_tile_params_.modified(big_tile_params)) {
     big_tile_params_ = big_tile_params;
     render_state_.need_reset_params = true;
@@ -140,6 +146,12 @@ void PathTrace::reset(const BufferParams &full_params,
   render_state_.tile_written = false;
 
   did_draw_after_reset_ = false;
+  draws_after_reset_ = 0;
+}
+
+void PathTrace::request_denoiser_history_reset()
+{
+  denoiser_history_reset_requested_.store(true);
 }
 
 void PathTrace::device_free()
@@ -189,6 +201,22 @@ void PathTrace::render_pipeline(RenderWork render_work)
   render_scheduler_.set_need_schedule_cryptomatte(device_scene_->data.film.cryptomatte_passes !=
                                                   0);
 
+  if (render_work.dlss.jitter_from_iteration) {
+    /* Offline only. The viewport deliberately does not come here: `plan_iteration()` restarts the
+     * Halton sequence on every iteration 0, so driving the viewport from it would give every
+     * played-back frame the same sub-pixel positions. There the jitter is owned by
+     * `Scene::update_camera_resolution()`, which advances a free-running Halton state once per
+     * render work. */
+    const DLSSIterationPlan plan = DLSSRenderController::plan_iteration(
+        render_work.dlss.iteration, render_work.dlss.reset_history, render_work.dlss.zero_motion);
+    render_work.dlss.reset_history = plan.reset_history;
+    render_work.dlss.zero_motion = plan.zero_motion;
+    device_scene_->data.integrator.pixel_jitter = plan.jitter;
+
+    /* The jitter changes for every independent 1-spp input without a full scene update. */
+    device_->const_copy_to("data", &device_scene_->data, sizeof(device_scene_->data));
+  }
+
   render_init_kernel_execution();
   SCOPED_DEFER(render_deinit_kernel_execution());
 
@@ -215,7 +243,27 @@ void PathTrace::render_pipeline(RenderWork render_work)
     render_scheduler_.set_limit_samples_per_update(limit);
   }
 
-  path_trace(render_work);
+  build_volume_froxel_grid(has_volume);
+  if (render_cancel_.is_requested) {
+    return;
+  }
+
+  /* Per-phase attribution of a render work, behind CYCLES_DEBUG_VIEWPORT_PHASES.
+   *
+   * Measuring a viewport frame as a whole has produced wrong conclusions twice, because the phases
+   * scale completely differently with the scene: on a 64-object scene the trace dominates, on a
+   * 742-mesh one the scene update does. */
+  static const bool phases_enabled = getenv("CYCLES_DEBUG_VIEWPORT_PHASES") != nullptr;
+  const double phase_start_time = phases_enabled ? time_dt() : 0.0;
+  double phase_trace_seconds = 0.0;
+  double phase_denoise_seconds = 0.0;
+  double phase_display_seconds = 0.0;
+
+  {
+    const double start = time_dt();
+    path_trace(render_work);
+    phase_trace_seconds = time_dt() - start;
+  }
   if (render_cancel_.is_requested) {
     return;
   }
@@ -237,7 +285,11 @@ void PathTrace::render_pipeline(RenderWork render_work)
     return;
   }
 
-  denoise(render_work);
+  {
+    const double start = time_dt();
+    denoise(render_work);
+    phase_denoise_seconds = time_dt() - start;
+  }
   if (render_cancel_.is_requested) {
     return;
   }
@@ -248,11 +300,29 @@ void PathTrace::render_pipeline(RenderWork render_work)
   }
 
   write_tile_buffer(render_work);
-  update_display(render_work);
+  {
+    const double start = time_dt();
+    update_display(render_work);
+    phase_display_seconds = time_dt() - start;
+  }
 
   progress_update_if_needed(render_work);
 
   finalize_full_buffer_on_disk(render_work);
+
+  if (phases_enabled) {
+    const double pipeline_seconds = time_dt() - phase_start_time;
+    const double other_seconds = pipeline_seconds - phase_trace_seconds -
+                                 phase_denoise_seconds - phase_display_seconds;
+    fprintf(stderr,
+            "PHASES pipeline_ms=%.2f trace_ms=%.2f denoise_ms=%.2f display_ms=%.2f other_ms=%.2f\n",
+            pipeline_seconds * 1000.0,
+            phase_trace_seconds * 1000.0,
+            phase_denoise_seconds * 1000.0,
+            phase_display_seconds * 1000.0,
+            other_seconds * 1000.0);
+    fflush(stderr);
+  }
 }
 
 void PathTrace::render_init_kernel_execution()
@@ -522,6 +592,13 @@ void PathTrace::adaptive_sample(RenderWork &render_work)
   }
 }
 
+void PathTrace::set_denoiser_external_images(const DenoiserExternalImages &images)
+{
+  if (denoiser_) {
+    denoiser_->set_external_images(images);
+  }
+}
+
 void PathTrace::set_denoiser_params(const DenoiseParams &params)
 {
   if (!params.use) {
@@ -546,7 +623,9 @@ void PathTrace::set_denoiser_params(const DenoiseParams &params)
 
     const bool is_cpu_denoising = old_denoiser_params.type == DENOISER_OPENIMAGEDENOISE &&
                                   old_denoiser_params.use_gpu == false;
-    const bool requested_gpu_denoising = effective_denoise_params.type == DENOISER_OPTIX ||
+    const bool always_gpu_denoising = effective_denoise_params.type == DENOISER_DLSS ||
+                                      effective_denoise_params.type == DENOISER_OPTIX;
+    const bool requested_gpu_denoising = always_gpu_denoising ||
                                          (effective_denoise_params.type ==
                                               DENOISER_OPENIMAGEDENOISE &&
                                           effective_denoise_params.use_gpu == true);
@@ -564,7 +643,7 @@ void PathTrace::set_denoiser_params(const DenoiseParams &params)
     /* Optix Denoiser is not supporting CPU devices, so use_gpu option is not
      * shown in the UI and changes in the option value should not be checked. */
     if (old_denoiser_params.type == effective_denoise_params.type &&
-        (is_same_denoising_device_type || effective_denoise_params.type == DENOISER_OPTIX))
+        (is_same_denoising_device_type || always_gpu_denoising))
     {
       denoiser_->set_params(effective_denoise_params);
     }
@@ -615,6 +694,82 @@ void PathTrace::cryptomatte_postprocess(const RenderWork &render_work)
   });
 }
 
+/* Ask the display side for the images the model reads, and hand them to the denoiser.
+ *
+ * Returns whether the display side took the job on. `CYCLES_DLSS_VULKAN` turns this off, for
+ * comparing the two paths on one build. */
+bool PathTrace::dlss_external_images_ensure()
+{
+  static const bool allowed = []() {
+    const char *value = getenv("CYCLES_DLSS_VULKAN");
+    return (value == nullptr) || atoi(value) != 0;
+  }();
+
+  if (!allowed || display_ == nullptr || !denoiser_ ||
+      denoiser_->get_params().type != DENOISER_DLSS)
+  {
+    return false;
+  }
+
+  /* A final render takes this path too, and measured on the rig it does: the model runs, the result
+   * comes back through the render buffer, and the file that gets saved is the denoised frame.
+   *
+   * What cannot take it is a render with no window at all. `blender -b` has no GPU context to
+   * allocate the shared images from, and there is no display driver either - which the check above
+   * already catches, so there is nothing more to say here. */
+
+  const BufferParams &render_params = render_state_.effective_big_tile_params;
+  const BufferParams &output_params = render_state_.effective_denoised_big_tile_params;
+
+  DenoiserExternalImages images;
+  display_->graphics_interop_activate();
+  const bool available = display_->dlss_denoiser_images_ensure(render_params.width,
+                                                               render_params.height,
+                                                               output_params.width,
+                                                               output_params.height,
+                                                               denoiser_->get_params().dlss_preset,
+                                                               images);
+  display_->graphics_interop_deactivate();
+
+  if (!available) {
+    if (dlss_external_active_) {
+      /* Back to denoising here, which means the denoiser has to let go of images it no longer
+       * owns a claim on. */
+      denoiser_->set_external_images(DenoiserExternalImages());
+      dlss_external_active_ = false;
+    }
+    return false;
+  }
+
+  if (images.is_set()) {
+    /* A new set: every previous handle is stale, and the history has nothing to carry over. */
+    denoiser_->set_external_images(images);
+    dlss_external_reset_ = true;
+  }
+
+  /* Run from inside the denoise pass, between the kernels that fill the images and the kernel that
+   * reads the result - the only order in which the result exists when it is wanted. */
+  denoiser_->set_external_evaluate([this](const bool reset_history) {
+    const float2 jitter = device_scene_->data.integrator.pixel_jitter;
+    display_->graphics_interop_activate();
+    /* Two reasons to start over: the images were remade, or the denoiser was asked to drop its
+     * history - a view change, or a capture stepping to its next frame. The second used to reach
+     * only the render-device path, so on this path the history survived every reset. */
+    const bool evaluated = display_->dlss_denoiser_evaluate(
+        jitter.x,
+        jitter.y,
+        dlss_external_reset_ || reset_history,
+        dlss_have_camera_transforms_ ? dlss_world_to_view_ : nullptr,
+        dlss_have_camera_transforms_ ? dlss_view_to_clip_ : nullptr);
+    display_->graphics_interop_deactivate();
+    dlss_external_reset_ = false;
+    return evaluated;
+  });
+
+  dlss_external_active_ = true;
+  return true;
+}
+
 void PathTrace::denoise(const RenderWork &render_work)
 {
   if (!render_work.tile.denoise) {
@@ -624,6 +779,20 @@ void PathTrace::denoise(const RenderWork &render_work)
   if (!denoiser_) {
     /* Denoiser was not configured, so nothing to do here. */
     return;
+  }
+
+  if (denoiser_history_reset_requested_.exchange(false)) {
+    denoiser_->reset_history();
+  }
+
+  if (render_work.dlss.iteration >= 0) {
+    if (render_work.dlss.reset_history) {
+      denoiser_->reset_history();
+    }
+    denoiser_->set_zero_motion(render_work.dlss.zero_motion);
+  }
+  else {
+    denoiser_->set_zero_motion(false);
   }
 
   LOG_DEBUG << "Perform denoising work.";
@@ -658,6 +827,45 @@ void PathTrace::denoise(const RenderWork &render_work)
     buffer_to_denoise = path_trace_works_.front()->get_render_buffers();
   }
 
+  /* Hand the camera over for a denoiser that asks for it. The kernel camera already holds both
+   * halves: `worldtocamera` is world to view, and `worldtondc` composed with `cameratoworld` is
+   * view to clip. Row-major 4x4, which is what the SDK's own helpers pass. */
+  {
+    const KernelCamera &cam = device_scene_->data.cam;
+    const ProjectionTransform view_to_clip = cam.worldtondc * cam.cameratoworld;
+
+    const auto write_row = [](float *matrix, const int row, const float4 &value) {
+      matrix[row * 4 + 0] = value.x;
+      matrix[row * 4 + 1] = value.y;
+      matrix[row * 4 + 2] = value.z;
+      matrix[row * 4 + 3] = value.w;
+    };
+
+    float world_to_view_matrix[16];
+    write_row(world_to_view_matrix, 0, cam.worldtocamera.x);
+    write_row(world_to_view_matrix, 1, cam.worldtocamera.y);
+    write_row(world_to_view_matrix, 2, cam.worldtocamera.z);
+    write_row(world_to_view_matrix, 3, make_float4(0.0f, 0.0f, 0.0f, 1.0f));
+
+    float view_to_clip_matrix[16];
+    write_row(view_to_clip_matrix, 0, view_to_clip.x);
+    write_row(view_to_clip_matrix, 1, view_to_clip.y);
+    write_row(view_to_clip_matrix, 2, view_to_clip.z);
+    write_row(view_to_clip_matrix, 3, view_to_clip.w);
+
+    denoiser_->set_camera_transforms(world_to_view_matrix, view_to_clip_matrix);
+
+    /* Kept for the evaluation below, which happens after this scope closes. */
+    std::copy_n(world_to_view_matrix, 16, dlss_world_to_view_);
+    std::copy_n(view_to_clip_matrix, 16, dlss_view_to_clip_);
+    dlss_have_camera_transforms_ = true;
+  }
+
+  /* Whether the display side will run the model this time, on images it allocates and this side
+   * fills. Asked every frame because the answer changes with the resolution and with the model
+   * chosen, and it is cheap: the images are remade only when one of those changes. */
+  dlss_external_images_ensure();
+
   if (denoiser_->denoise_buffer(render_state_.effective_big_tile_params,
                                 render_state_.effective_denoised_big_tile_params,
                                 buffer_to_denoise,
@@ -667,8 +875,241 @@ void PathTrace::denoise(const RenderWork &render_work)
   {
     render_state_.has_denoised_result = true;
   }
+  else if (denoiser_->get_params().type == DENOISER_DLSS && denoiser_->get_params().dlss_offline) {
+    dlss_runtime_failed_ = true;
+    progress_->set_cancel("DLSS runtime evaluation failed; retrying with OptiX");
+  }
+
 
   render_scheduler_.report_denoise_time(render_work, time_dt() - start_time);
+}
+
+float PathTrace::volume_froxel_far_distance()
+{
+  const KernelVolumeFroxel &froxel = device_scene_->data.froxel;
+
+  /* `CYCLES_FROXEL_FAR` overrides everything, for measurements driven from a script. */
+  static const float froxel_far_forced = []() {
+    const char *value = getenv("CYCLES_FROXEL_FAR");
+    return (value != nullptr) ? float(atof(value)) : 0.0f;
+  }();
+  if (froxel_far_forced > 0.0f) {
+    return froxel_far_forced;
+  }
+
+  if (froxel.user_distance > 0.0f) {
+    return froxel.user_distance;
+  }
+
+  /* Otherwise reach exactly as far as the media do. The camera's own far plane is no use here -
+   * the defaults span ten orders of magnitude, and slices spread over that put the whole of a fog
+   * bank inside one of them. The far corner of the volume bounds is the honest answer, and it is
+   * what keeps the grid working in a scene nobody tuned it for. */
+  if (froxel.bounds_min.w == 0.0f) {
+    return 100.0f;
+  }
+
+  const float3 camera_P = transform_get_column(&device_scene_->data.cam.cameratoworld, 3);
+  const float3 bounds_min = make_float3(
+      froxel.bounds_min.x, froxel.bounds_min.y, froxel.bounds_min.z);
+  const float3 bounds_max = make_float3(
+      froxel.bounds_max.x, froxel.bounds_max.y, froxel.bounds_max.z);
+
+  float far_distance = 0.0f;
+  for (int corner = 0; corner < 8; corner++) {
+    const float3 P = make_float3((corner & 1) ? bounds_max.x : bounds_min.x,
+                                 (corner & 2) ? bounds_max.y : bounds_min.y,
+                                 (corner & 4) ? bounds_max.z : bounds_min.z);
+    far_distance = max(far_distance, len(P - camera_P));
+  }
+
+  return (far_distance > 0.0f) ? far_distance : 100.0f;
+}
+
+void PathTrace::set_volume_grid_hold(const bool hold)
+{
+  volume_grid_hold_.store(hold, std::memory_order_relaxed);
+}
+
+float PathTrace::volume_froxel_blend()
+{
+  if (device_scene_->data.froxel.always) {
+    return 1.0f;
+  }
+
+  /* A capture of the moving viewport reads its frame a few accumulations in, by which point the
+   * fade would already have handed a share of the pixels back to the tracer - one sample each,
+   * and the reconstruction has no guide for a medium, so that share came out as grain over the
+   * whole of the fog. Measured: the grain was the fade, and at full weight the fog is clean. */
+  if (volume_grid_hold_.load(std::memory_order_relaxed)) {
+    return 1.0f;
+  }
+
+  /* How many frames the grid takes to hand back over to the path tracer once the view settles.
+   * Instant would show as a step in the picture; too slow and the approximation is what the user
+   * looks at while deciding the shot. */
+  static const int fade_frames = []() {
+    const char *value = getenv("CYCLES_FROXEL_FADE");
+    const int parsed = (value != nullptr) ? atoi(value) : 12;
+    return max(parsed, 1);
+  }();
+
+  /* Any camera or scene change goes through `RenderScheduler::reset()`, which clears this count,
+   * so it is exactly "how many frames since anything moved". */
+  const int settled_frames = render_scheduler_.get_num_rendered_samples();
+  return clamp(1.0f - float(settled_frames) / float(fade_frames), 0.0f, 1.0f);
+}
+
+void PathTrace::build_volume_froxel_grid(const bool has_volume)
+{
+  KernelVolumeFroxel &froxel = device_scene_->data.froxel;
+
+  /* The scene setting is what asks for the grid. `CYCLES_FROXEL` still forces it on, because every
+   * measurement here is driven from a script that has no interface to click. */
+  static const bool froxel_forced = []() {
+    const char *value = getenv("CYCLES_FROXEL");
+    return (value != nullptr) && atoi(value) != 0;
+  }();
+
+  /* Once the fade has run out the grid accounts for none of the pixel, so there is nothing to
+   * build and the frame is the honest one - which is what "While Moving" has to mean to be worth
+   * having. */
+  const float blend = volume_froxel_blend();
+  const bool froxel_requested = froxel.requested || froxel_forced;
+
+  /* A final render is background, and the grid is a viewport thing, so it does not run there. But
+   * that also means the grid can only ever be seen next to the traced result through a screen
+   * capture, and comparing a capture against a rendered file measures the display path as much as
+   * the grid. Forcing it on lifts this too, so that both pictures come out of the same F12 and
+   * differ in nothing but the medium. Measurement only - the setting alone never does this. */
+  const bool background = render_scheduler_.is_background() && !froxel_forced;
+  const bool enabled = froxel_requested && has_volume && !background && blend > 0.0f;
+
+  /* Said once, whatever the answer: "why is the grid not on" is otherwise guesswork, and each guess
+   * costs a build. */
+  static bool reported_gate = false;
+  if (!reported_gate) {
+    reported_gate = true;
+    LOG_INFO << "Volume froxel gate: requested=" << froxel_requested
+                << " has_volume=" << has_volume
+                << " background=" << render_scheduler_.is_background()
+                << " forced=" << froxel_forced
+                << " width=" << render_state_.effective_big_tile_params.width
+                << " height=" << render_state_.effective_big_tile_params.height;
+  }
+
+  if (!enabled) {
+    if (froxel.enabled) {
+      froxel.enabled = 0;
+      device_->const_copy_to("data", &device_scene_->data, sizeof(device_scene_->data));
+    }
+    return;
+  }
+
+  const BufferParams &params = render_state_.effective_big_tile_params;
+  if (params.width <= 0 || params.height <= 0) {
+    return;
+  }
+
+  const int tile = 8;
+  froxel.tile = tile;
+  froxel.res_x = divide_up(params.width, tile);
+  froxel.res_y = divide_up(params.height, tile);
+  froxel.res_z = 64;
+  froxel.t_near = max(device_scene_->data.cam.nearclip, 1e-3f);
+  froxel.t_far = max(volume_froxel_far_distance(), froxel.t_near * 2.0f);
+  froxel.blend = blend;
+  froxel.enabled = 1;
+
+  /* Which part of the injection to run, for attributing a fault to a step rather than to the grid
+   * as a whole. Zero, the default, runs all of it. */
+  static const int froxel_stage = []() {
+    const char *value = getenv("CYCLES_FROXEL_STAGE");
+    return (value) ? atoi(value) : 0;
+  }();
+  froxel.stage = froxel_stage;
+
+  /* The count comes from the scene; the variable overrides it for measurements driven from a
+   * script. Eight is the default because the answer is the same every frame for a given cell
+   * either way - the seed is a function of the cell - so more of them buys accuracy rather than
+   * stability: with one sample, neighbouring cells pick different lights and the fog comes out in
+   * soft patches. */
+  static const int froxel_light_samples_forced = []() {
+    const char *value = getenv("CYCLES_FROXEL_LIGHT_SAMPLES");
+    return (value) ? max(atoi(value), 0) : -1;
+  }();
+  if (froxel_light_samples_forced >= 0) {
+    froxel.light_samples = froxel_light_samples_forced;
+  }
+
+  /* Which of the lighting corrections to apply, as a bit per fix - see `VolumeFroxelFix`. All of
+   * the ones that have been measured are on; the variable is what turns them off again, one at a
+   * time, so a picture can be attributed to a correction rather than to the set of them.
+   *
+   * Measured on a cube of noise-driven smoke against a converged path trace, as a fraction of the
+   * energy of the traced single scattering: the grid gave 0.00 without them - a light outside the
+   * hull reached the fog not at all - 0.73 with the hull no longer counted as a wall, 0.74 with
+   * the slices weighed by coverage, 0.82 with the shadow walked through the density octree, and
+   * 1.00 once that walk read the density a third of the way up a node's extrema. Against the full
+   * path, with multiple scattering standing in, 0.94. All of it together costs 3 to 6 percent of
+   * the frame. */
+  static const int froxel_fixes = []() {
+    const char *value = getenv("CYCLES_FROXEL_FIX");
+    return (value != nullptr) ? int(strtol(value, nullptr, 0)) :
+                                (VOLUME_FROXEL_FIX_EMITTER_ESTIMATE |
+                                 VOLUME_FROXEL_FIX_UNBOUNDED_SHADOW |
+                                 VOLUME_FROXEL_FIX_MARCHED_SHADOW |
+                                 VOLUME_FROXEL_FIX_SLICE_OVERLAP |
+                                 VOLUME_FROXEL_FIX_WORLD_VOLUME |
+                                 VOLUME_FROXEL_FIX_MULTI_SCATTER |
+                                 VOLUME_FROXEL_FIX_HULL_SHADOW);
+  }();
+  froxel.fixes = froxel_fixes;
+
+  /* Two numbers the corrections are fitted with. Both are read from the environment so that they
+   * can be swept against the traced result without a rebuild; the defaults are what that sweep
+   * settled on. */
+  static const float froxel_sigma_mix = []() {
+    const char *value = getenv("CYCLES_FROXEL_SIGMA_MIX");
+    return (value != nullptr) ? float(atof(value)) : 0.33f;
+  }();
+  froxel.shadow_sigma_mix = froxel_sigma_mix;
+
+  static const float froxel_multi_scatter = []() {
+    const char *value = getenv("CYCLES_FROXEL_MULTI_SCATTER");
+    return (value != nullptr) ? float(atof(value)) : 1.0f;
+  }();
+  froxel.multi_scatter_return = froxel_multi_scatter;
+
+  const size_t num_cells = size_t(froxel.res_x) * froxel.res_y * froxel.res_z;
+  if (device_scene_->volume_froxel_scatter.size() != num_cells) {
+    /* `copy_to_device` is what binds the pointer a global array is read through - `zero_to_device`
+     * alone leaves the kernel dereferencing null, which shows up as an illegal address inside the
+     * froxel kernels rather than as anything resembling its cause. */
+    float4 *scatter = device_scene_->volume_froxel_scatter.alloc(num_cells);
+    memset(scatter, 0, num_cells * sizeof(float4));
+    device_scene_->volume_froxel_scatter.copy_to_device();
+  }
+
+  device_->const_copy_to("data", &device_scene_->data, sizeof(device_scene_->data));
+
+  const double start_time = time_dt();
+
+  parallel_for_each(path_trace_works_, [&](unique_ptr<PathTraceWork> &path_trace_work) {
+    path_trace_work->build_volume_froxel_grid();
+  });
+
+  /* Said once, because "did the grid actually turn on" is the first question of every measurement
+   * and reading it off the picture is guesswork. */
+  static bool announced = false;
+  if (!announced) {
+    announced = true;
+    LOG_INFO << "Volume froxel grid active: " << froxel.res_x << "x" << froxel.res_y << "x"
+             << froxel.res_z << " cells, depth " << froxel.t_near << " to " << froxel.t_far
+             << ", built in " << time_dt() - start_time << " seconds.";
+  }
+
+  LOG_DEBUG << "Volume froxel grid built in " << time_dt() - start_time << " seconds.";
 }
 
 void PathTrace::denoise_volume_guiding_buffers(const RenderWork &render_work,
@@ -718,13 +1159,18 @@ void PathTrace::zero_display()
   }
 }
 
-void PathTrace::draw()
+bool PathTrace::draw()
 {
   if (!display_) {
-    return;
+    return false;
   }
 
-  did_draw_after_reset_ |= display_->draw();
+  /* Counted before the result is folded in: the point is to know the UI thread got here at all,
+   * separately from whether it found fresh pixels waiting when it did. */
+  draws_after_reset_++;
+  const bool fresh = display_->draw();
+  did_draw_after_reset_ |= fresh;
+  return fresh;
 }
 
 void PathTrace::flush_display()
@@ -911,7 +1357,11 @@ void PathTrace::cancel()
 {
   thread_scoped_lock lock(render_cancel_.mutex);
 
-  render_cancel_.is_requested = true;
+  /* Only cancel in the middle of rendering when there is at least one sample in the output.
+   * Otherwise interactivity becomes bad. */
+  if (render_scheduler_.is_background() || get_num_samples_in_buffer() > 1) {
+    render_cancel_.is_requested = true;
+  }
 
   while (render_cancel_.is_rendering) {
     render_cancel_.condition.wait(lock);
@@ -920,8 +1370,23 @@ void PathTrace::cancel()
   render_cancel_.is_requested = false;
 }
 
-int PathTrace::get_num_samples_in_buffer()
+int PathTrace::get_num_samples_in_buffer() const
 {
+  if (denoiser_ && denoiser_->get_params().type == DENOISER_DLSS) {
+    /* The DLSS path normally clears the buffer before every iteration, so what it holds is one
+     * iteration's worth of samples - not the running total. That is the number the denoiser and the
+     * display have to scale by.
+     *
+     * While the buffer is accumulating - camera still, `CYCLES_DLSS_ACCUMULATE` on - it holds the
+     * running total instead, and everything that divides by this number has to see the real one or
+     * the frame comes out scaled by however many iterations have gone by. */
+    if (render_scheduler_.is_accumulating_in_buffer()) {
+      return render_scheduler_.get_num_rendered_samples();
+    }
+    return render_scheduler_.get_num_rendered_samples() > 0 ?
+               RenderScheduler::get_dlss_samples_per_iteration() :
+               0;
+  }
   return render_scheduler_.get_num_rendered_samples();
 }
 
@@ -1155,7 +1620,7 @@ int PathTrace::get_num_render_tile_samples() const
     return full_frame_state_.render_buffers->params.samples;
   }
 
-  return render_scheduler_.get_num_rendered_samples();
+  return get_num_samples_in_buffer();
 }
 
 bool PathTrace::get_render_tile_pixels(const PassAccessor &pass_accessor,
@@ -1216,6 +1681,16 @@ int2 PathTrace::get_render_tile_size() const
   return make_int2(tile.window_width, tile.window_height);
 }
 
+int2 PathTrace::get_render_tile_input_size() const
+{
+  if (full_frame_state_.render_buffers) {
+    return make_int2(full_frame_state_.render_buffers->params.window_width,
+                     full_frame_state_.render_buffers->params.window_height);
+  }
+  return make_int2(render_state_.effective_big_tile_params.window_width,
+                   render_state_.effective_big_tile_params.window_height);
+}
+
 int2 PathTrace::get_render_tile_offset() const
 {
   if (full_frame_state_.render_buffers) {
@@ -1243,6 +1718,16 @@ const BufferParams &PathTrace::get_render_tile_params() const
 bool PathTrace::has_denoised_result() const
 {
   return render_state_.has_denoised_result;
+}
+
+bool PathTrace::is_dlss_denoising() const
+{
+  return denoiser_ && denoiser_->get_params().type == DENOISER_DLSS;
+}
+
+bool PathTrace::dlss_runtime_failed() const
+{
+  return dlss_runtime_failed_;
 }
 
 void PathTrace::destroy_gpu_resources()

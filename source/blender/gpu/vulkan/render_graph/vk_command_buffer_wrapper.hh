@@ -24,6 +24,16 @@ class VKCommandBufferInterface {
   VKCommandBufferInterface() {}
   virtual ~VKCommandBufferInterface() = default;
 
+  /**
+   * Native command buffer for vendor SDK commands which cannot be represented by the
+   * generic
+   * command interface. Test command buffers intentionally return VK_NULL_HANDLE.
+ */
+  virtual VkCommandBuffer native_handle_get() const
+  {
+    return VK_NULL_HANDLE;
+  }
+
   virtual void begin_recording() = 0;
   virtual void end_recording() = 0;
 
@@ -159,6 +169,11 @@ class VKCommandBufferWrapper : public VKCommandBufferInterface {
 
  public:
   VKCommandBufferWrapper(VkCommandBuffer vk_command_buffer, const VKExtensions &extensions);
+
+  VkCommandBuffer native_handle_get() const override
+  {
+    return vk_command_buffer_;
+  }
 
   void begin_recording() override;
   void end_recording() override;

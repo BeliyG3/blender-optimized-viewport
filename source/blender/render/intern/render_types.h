@@ -254,5 +254,8 @@ struct RenderDisplay {
  * will be written from the File Output nodes, since the render pipeline will early fail if neither
  * a File Output nor a Group Output node exist in the scene. */
 #define R_SKIP_WRITE 1 << 1
+/* The current RE_RenderAnim call contains more than one frame. Unlike R_ANIMATION, this is false
+ * for command-line `-f`, whose one-frame calls must not share temporal renderer state. */
+#define R_FRAME_SEQUENCE 1 << 2
 
 }  // namespace blender

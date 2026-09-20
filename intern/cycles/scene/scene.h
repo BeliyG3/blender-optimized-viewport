@@ -188,8 +188,13 @@ class Scene : public NodeOwner {
   /* parameters */
   SceneParams params;
 
-  /* mutex must be locked manually by callers */
-  thread_mutex mutex;
+  /* mutex must be locked manually by callers.
+   *
+   * Timed rather than plain: the sync coming from Blender used to give up the moment it found this
+   * held, and with DLSS the session thread takes it at the start of every accumulation iteration -
+   * for microseconds on all but the first. Four out of five refused syncs were losing a whole frame
+   * to a lock that was about to be free. */
+  std::timed_mutex mutex;
   bool scene_updated_while_loading_kernels = false;
 
   /* scene update statistics */
@@ -209,6 +214,10 @@ class Scene : public NodeOwner {
 
   bool need_update();
   bool need_reset(const bool check_camera = true);
+
+  /* Comma-separated list of the managers that are dirty, for diagnostics. Tells a real depsgraph
+   * update apart from the interactive motion pass re-tagging itself. */
+  string update_reason();
 
   void reset();
   void device_free();
@@ -268,6 +277,11 @@ class Scene : public NodeOwner {
 
   bool kernels_loaded;
   uint loaded_kernel_features;
+
+  /* Consecutive calls to `update()` that found nothing changed. Settling the interactive motion
+   * history runs the geometry manager, so it waits for a run of these rather than firing between
+   * two frames of playback where the next update would overwrite it anyway. */
+  int idle_updates_ = 0;
 
   void update_kernel_features();
 

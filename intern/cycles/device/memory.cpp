@@ -141,6 +141,13 @@ void device_memory::device_copy_to()
   }
 }
 
+void device_memory::device_copy_to_range(const size_t offset_bytes, const size_t size_bytes)
+{
+  if (host_pointer) {
+    device->mem_copy_to_range(*this, offset_bytes, size_bytes);
+  }
+}
+
 void device_memory::device_move_to_host()
 {
   if (host_pointer) {

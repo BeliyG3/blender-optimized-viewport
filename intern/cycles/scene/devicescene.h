@@ -92,6 +92,11 @@ class DeviceScene {
   device_vector<int> volume_tree_root_ids;
   device_vector<float> volume_step_size;
 
+  /* Camera-aligned volume grid: per-cell emission with extinction, and the same integrated front to
+   * back so a ray segment costs two lookups. Allocated when the viewport asks for the froxel
+   * volume, left empty otherwise. */
+  device_vector<float4> volume_froxel_scatter;
+
   /* Image textures */
   device_vector<KernelImageTexture> image_textures;
   device_vector<KernelTileDescriptor> image_texture_tile_descriptors;

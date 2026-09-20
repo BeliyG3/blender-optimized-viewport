@@ -276,6 +276,14 @@ def enum_openimagedenoise_denoiser(self, context):
     return []
 
 
+def enum_dlss_denoiser(self, context):
+    import _cycles
+    if _cycles.with_dlss and (not context or bool(context.preferences.addons[__package__].preferences.get_devices_for_type('CUDA'))):
+        return [('DLSS', "DLSS",
+                 n_("Use NVIDIA DLSS Ray Reconstruction"), 8)]
+    return []
+
+
 def enum_optix_denoiser(self, context):
     if not context or bool(context.preferences.addons[__package__].preferences.get_devices_for_type('OPTIX')):
         return [('OPTIX', "OptiX", n_(
@@ -344,6 +352,103 @@ enum_denoising_quality = (
      "High performance",
      3),
 )
+enum_denoising_upscale_quality = (
+    ('NONE',
+     "None",
+     "Highest quality without upscaling",
+     0),
+    ('QUALITY',
+     "Quality",
+     "Offers higher image quality than balanced mode",
+     1),
+    ('BALANCED',
+     "Balanced",
+     "Offers both optimized performance and image quality",
+     2),
+    ('PERF',
+     "Performance",
+     "Offers a higher performance boost than balanced mode",
+     3),
+    ('ULTRA_PERF',
+     "Ultra Performance",
+     "Offers the highest performance boost",
+     4),
+)
+
+
+def _dlss_bool_get(storage_name, default):
+    return lambda self: bool(self.get(storage_name, default))
+
+
+def _dlss_bool_set(storage_name):
+    return lambda self, value: self.__setitem__(storage_name, bool(value))
+
+
+def _dlss_int_get(storage_name, default):
+    return lambda self: int(self.get(storage_name, default))
+
+
+def _dlss_int_set(storage_name):
+    return lambda self, value: self.__setitem__(storage_name, int(value))
+
+
+def _dlss_float_get(storage_name, default):
+    return lambda self: float(self.get(storage_name, default))
+
+
+def _dlss_float_set(storage_name):
+    return lambda self, value: self.__setitem__(storage_name, float(value))
+
+
+enum_dlss_preset = (
+    ('DEFAULT',
+     "Default",
+     "Let NGX pick the model. What that means can change with a driver update",
+     0),
+    ('D',
+     "D (Transformer)",
+     "The default transformer model",
+     4),
+    ('E',
+     "E (Transformer)",
+     "The transformer model of Ray Reconstruction 4.0, and the one required for depth of field "
+     "guidance",
+     5),
+    ('F',
+     "F (Transformer 4.5)",
+     "The model the current driver selects for Blender on its own. The SDK's own headers still "
+     "list F as one not to request, and its integration guide recommends Default instead, but the "
+     "driver ships it and applies it regardless",
+     6),
+)
+
+
+enum_dlss_playblast_mode = (
+    ('FAST',
+     "As Viewport",
+     "One input per frame with the DLSS history carried across, at the viewport's own rate - the "
+     "picture the viewport shows while the timeline plays",
+     0),
+    ('CONVERGE',
+     "Converge",
+     "Wait for the viewport sample count on every frame - the picture the viewport shows once it "
+     "settles",
+     1),
+)
+
+
+enum_approximate_volumes_mode = (
+    ('MOVING',
+     "While Moving",
+     "Stand in for the medium while the view is moving, and fade back to the traced result over "
+     "twelve frames once it settles",
+     0),
+    ('ALWAYS',
+     "Always",
+     "Stand in for the medium at all times, so the picture stays approximate after the view "
+     "settles rather than converging",
+     1),
+)
 
 enum_direct_light_sampling_type = (
     ('MULTIPLE_IMPORTANCE_SAMPLING',
@@ -369,6 +474,18 @@ def update_render_passes(self, context):
 def update_render_engine(self, context):
     scene = context.scene
     scene.update_render_engine()
+
+
+def update_viewport_redraw(self, context):
+    """Redraw the 3D viewports without restarting the render.
+
+    Enough for settings that only change what the engine reports, and cheaper than tagging the
+    engine itself, which would throw away the accumulated samples.
+    """
+    for window in context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
 
 
 def update_world(self, context):
@@ -480,6 +597,161 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
         name="Denoise Preview on GPU",
         description="Perform denoising on GPU devices configured in the system tab in the user preferences. This is significantly faster than on CPU, but requires additional GPU memory. When large scenes need more GPU memory, this option can be disabled",
         default=True,
+    )
+    preview_denoising_upscale_quality: EnumProperty(
+        name="Viewport Denoising Upscale Quality",
+        description="Overall quality when using DLSS",
+        items=enum_denoising_upscale_quality,
+        default='BALANCED',
+    )
+
+    # These public RNA properties proxy IDProperties with a stable prefix. Official Blender 5.2
+    # ignores the unknown keys but preserves them on save, so a custom -> official -> custom
+    # round-trip does not require DNA changes.
+    use_dlss_preview: BoolProperty(
+        name="Use DLSS Ray Reconstruction",
+        description="Use NVIDIA DLSS Ray Reconstruction in the rendered viewport",
+        get=_dlss_bool_get("cycles_dlss_use_preview", False),
+        set=_dlss_bool_set("cycles_dlss_use_preview"),
+        update=update_render_passes,
+    )
+    dlss_preview_mode: EnumProperty(
+        name="DLSS Viewport Mode",
+        description="DLSS Ray Reconstruction viewport quality mode",
+        items=enum_denoising_upscale_quality,
+        get=_dlss_int_get("cycles_dlss_preview_mode", 2),
+        set=_dlss_int_set("cycles_dlss_preview_mode"),
+        update=update_render_passes,
+    )
+    dlss_playblast_mode: EnumProperty(
+        name="Viewport Render",
+        description=(
+            "What a viewport render or playblast of the Rendered viewport waits for on each frame "
+            "before reading it out"
+        ),
+        items=enum_dlss_playblast_mode,
+        get=_dlss_int_get("cycles_dlss_playblast_mode", 0),
+        set=_dlss_int_set("cycles_dlss_playblast_mode"),
+    )
+    use_dlss_frame_generation: BoolProperty(
+        name="Use DLSS Frame Generation 2x",
+        description=(
+            "Generate one intermediate frame while the Cycles viewport is moving "
+            "(experimental, requires Vulkan and an RTX 40 or RTX 50 GPU)"
+        ),
+        get=_dlss_bool_get("cycles_dlss_use_frame_generation", False),
+        set=_dlss_bool_set("cycles_dlss_use_frame_generation"),
+        update=update_render_passes,
+    )
+    dlss_preset: EnumProperty(
+        name="DLSS Model",
+        description=(
+            "Which Ray Reconstruction model to ask NGX for. This is a request, not a decision: a "
+            "driver profile can override it, and the model actually used is shown in Preferences "
+            "under DLSS Libraries"
+        ),
+        items=enum_dlss_preset,
+        get=_dlss_int_get("cycles_dlss_preset", 6),
+        set=_dlss_int_set("cycles_dlss_preset"),
+    )
+    use_approximate_volumes: BoolProperty(
+        name="Approximate Volumes",
+        description=(
+            "Read volumes from a camera-aligned grid in the rendered viewport instead of tracing "
+            "them. The answer is approximate, but it carries no noise at all - which is what lets "
+            "an object inside dense fog be seen while the view is moving"
+        ),
+        get=_dlss_bool_get("cycles_approximate_volumes", True),
+        set=_dlss_bool_set("cycles_approximate_volumes"),
+    )
+    approximate_volumes_mode: EnumProperty(
+        name="Approximate Volumes Mode",
+        description="When the grid stands in for the traced medium",
+        items=enum_approximate_volumes_mode,
+        get=_dlss_int_get("cycles_approximate_volumes_mode", 0),
+        set=_dlss_int_set("cycles_approximate_volumes_mode"),
+    )
+    approximate_volumes_distance: FloatProperty(
+        name="Distance",
+        description=(
+            "How far the grid reaches, in scene units. Zero takes it from the bounds of the "
+            "volumes in the scene, which is right unless a huge volume makes the slices too "
+            "coarse where they matter"
+        ),
+        min=0.0, max=1e6, soft_max=1000.0, default=0.0,
+        get=_dlss_float_get("cycles_approximate_volumes_distance", 0.0),
+        set=_dlss_float_set("cycles_approximate_volumes_distance"),
+    )
+    approximate_volumes_light_samples: IntProperty(
+        name="Light Samples",
+        description=(
+            "Light samples per grid cell. These do not flicker between frames - the seed follows "
+            "the cell - so more of them buys accuracy rather than stability. Zero leaves the fog "
+            "unlit: it still blocks and glows, but nothing shines through it"
+        ),
+        min=0, max=64,
+        get=_dlss_int_get("cycles_approximate_volumes_light_samples", 8),
+        set=_dlss_int_set("cycles_approximate_volumes_light_samples"),
+    )
+    use_dlss_render: BoolProperty(
+        name="Use DLSS for Render",
+        description="Use experimental NVIDIA DLSS Ray Reconstruction for final rendering",
+        get=_dlss_bool_get("cycles_dlss_use_render", False),
+        set=_dlss_bool_set("cycles_dlss_use_render"),
+        update=update_render_passes,
+    )
+    dlss_render_mode: EnumProperty(
+        name="DLSS Render Mode",
+        description="DLSS Ray Reconstruction final render quality mode",
+        items=enum_denoising_upscale_quality,
+        get=_dlss_int_get("cycles_dlss_render_mode", 1),
+        set=_dlss_int_set("cycles_dlss_render_mode"),
+        update=update_render_passes,
+    )
+    dlss_still_iterations: IntProperty(
+        name="Still Iterations",
+        description="Independent one-sample DLSS evaluations for a still render",
+        min=1, max=256,
+        get=_dlss_int_get("cycles_dlss_still_iterations", 16),
+        set=_dlss_int_set("cycles_dlss_still_iterations"),
+    )
+    dlss_animation_iterations: IntProperty(
+        name="Animation Iterations",
+        description="Independent one-sample DLSS evaluations for a normal animation frame",
+        min=1, max=64,
+        get=_dlss_int_get("cycles_dlss_animation_iterations", 4),
+        set=_dlss_int_set("cycles_dlss_animation_iterations"),
+    )
+    dlss_reset_iterations: IntProperty(
+        name="Reset Iterations",
+        description="Zero-motion warm-up evaluations after a history reset",
+        min=1, max=64,
+        get=_dlss_int_get("cycles_dlss_reset_iterations", 8),
+        set=_dlss_int_set("cycles_dlss_reset_iterations"),
+    )
+    use_dlss_interactive_samples: BoolProperty(
+        name="Interactive Sample Limit",
+        description="Stop at a reduced sample count while navigating, transforming or playing back "
+                    "the timeline, and let the DLSS temporal history carry the image. Accumulation "
+                    "resumes up to Max Samples as soon as the viewport settles",
+        get=_dlss_bool_get("cycles_dlss_use_interactive_samples", True),
+        set=_dlss_bool_set("cycles_dlss_use_interactive_samples"),
+    )
+    use_dlss_viewport_fps: BoolProperty(
+        name="Show Viewport FPS",
+        description="Draw the rate at which the viewport receives new rendered pixels in the "
+                    "corner of the 3D viewport. Unlike Blender's playback FPS this measures the "
+                    "renderer, so it is meaningful while orbiting a still frame as well",
+        get=_dlss_bool_get("cycles_dlss_use_viewport_fps", False),
+        set=_dlss_bool_set("cycles_dlss_use_viewport_fps"),
+        update=update_viewport_redraw,
+    )
+    dlss_interactive_samples: IntProperty(
+        name="Interactive Samples",
+        description="Sample count the viewport stops at while the user is interacting",
+        min=1, max=64,
+        get=_dlss_int_get("cycles_dlss_interactive_samples", 4),
+        set=_dlss_int_set("cycles_dlss_interactive_samples"),
     )
 
     samples: IntProperty(
@@ -1622,6 +1894,20 @@ class CyclesDeviceSettings(bpy.types.PropertyGroup):
     type: EnumProperty(name="Type", items=enum_device_type, default='CUDA')
 
 
+def _dlss_dlssd_versions(self, context):
+    """Driver-installed Ray Reconstruction versions. See `dlss_library.version_enum_items`."""
+    from . import dlss_library
+
+    return dlss_library.version_enum_items("dlssd")
+
+
+def _dlss_dlssg_versions(self, context):
+    """Driver-installed Frame Generation versions. See `dlss_library.version_enum_items`."""
+    from . import dlss_library
+
+    return dlss_library.version_enum_items("dlssg")
+
+
 class CyclesPreferences(bpy.types.AddonPreferences):
     bl_idname = __package__
 
@@ -1660,6 +1946,22 @@ class CyclesPreferences(bpy.types.AddonPreferences):
     )
 
     devices: CollectionProperty(type=CyclesDeviceSettings)
+
+    # Which driver-installed version the button beside the list will install. One property per
+    # feature, since a dynamic enum callback is told nothing about which widget is asking.
+    dlss_dlssd_version: EnumProperty(
+        name="Ray Reconstruction Version",
+        description="Which driver-installed DLSS Ray Reconstruction library to install. "
+                    "Newest first; a newer library is not always the better one",
+        items=_dlss_dlssd_versions,
+    )
+
+    dlss_dlssg_version: EnumProperty(
+        name="Frame Generation Version",
+        description="Which driver-installed DLSS Frame Generation library to install. "
+                    "Newest first; a newer library is not always the better one",
+        items=_dlss_dlssg_versions,
+    )
 
     peer_memory: BoolProperty(
         name="Distribute memory across devices",
@@ -1821,6 +2123,22 @@ class CyclesPreferences(bpy.types.AddonPreferences):
 
                 has_device_oidn_support = device[5]
                 if has_device_oidn_support and self.find_existing_device_entry(device).use:
+                    return True
+
+        return False
+
+    def has_dlss_gpu_devices(self):
+        compute_device_type = self.get_compute_device_type()
+
+        # We need non-CPU devices, used for rendering and supporting DLSS
+        if compute_device_type != 'NONE':
+            for device in self.get_device_list(compute_device_type):
+                device_type = device[1]
+                if device_type == 'CPU':
+                    continue
+
+                has_device_dlss_support = device[8]
+                if has_device_dlss_support and self.find_existing_device_entry(device).use:
                     return True
 
         return False
@@ -2002,6 +2320,105 @@ class CyclesPreferences(bpy.types.AddonPreferences):
             row = layout.row()
             row.active = has_hardware_rt
             row.prop(self, "use_oneapirt")
+
+        if compute_device_type in {'CUDA', 'OPTIX'}:
+            self._draw_dlss_library(layout)
+
+    def _draw_dlss_library(self, layout):
+        """The DLSS feature libraries, which this build does not ship.
+
+        NVIDIA's licence does not allow shipping them beside a GPL application, and the driver
+        installs them anyway - they just sit under a name NGX will not look for. This offers to
+        copy them into place. See `dlss_library.py` for why that copy is necessary at all.
+        """
+        import _cycles
+        from . import dlss_library
+
+        if not _cycles.with_dlss or not dlss_library.is_supported():
+            return
+
+        layout.separator()
+        layout.label(text=rpt_("DLSS Libraries"), translate=False)
+
+        col = layout.column()
+        col.use_property_decorate = False
+
+        if dlss_library.ngx_models_root() is None:
+            self._dlss_row(col, "").label(
+                text=rpt_("No NVIDIA driver with DLSS support was found"), translate=False)
+            return
+
+        for feature, (_file_name, label) in dlss_library.FEATURES.items():
+            versions = dlss_library.available_versions(feature)
+            path, installed_text = dlss_library.installed_version(feature)
+            property_name = "dlss_{:s}_version".format(feature)
+
+            if not versions or not hasattr(self, property_name):
+                if installed_text is not None:
+                    text = rpt_("{:s} installed").format(installed_text)
+                elif path is not None:
+                    text = rpt_("Installed")
+                else:
+                    text = rpt_("Not provided by this driver")
+                self._dlss_row(col, label).label(text=text, translate=False)
+                continue
+
+            # The list picks a version - newest first, since that is what is wanted almost always,
+            # while an older one stays one click away: a newer library is not always the better one.
+            selected = getattr(self, property_name)
+            installed = {text for _sort_key, text, _path in dlss_library.installed_versions(feature)}
+
+            row = self._dlss_row(col, label)
+            row.prop(self, property_name, text="")
+
+            button = row.row(align=True)
+            button.ui_units_x = 5
+            props = button.operator(
+                "cycles.install_dlss_library",
+                text=rpt_("Use") if selected in installed else rpt_("Install"),
+                translate=False,
+            )
+            props.feature = feature
+            props.version = selected
+
+            # Deleting is offered only for a version that is installed, and never for the one this
+            # session is using: NGX holds that file open, so the button could only ever fail.
+            remove = row.row(align=True)
+            remove.enabled = (selected in installed and
+                              selected != dlss_library.active_version_at_startup(feature))
+            remove_props = remove.operator(
+                "cycles.remove_dlss_library", text="", icon='TRASH', translate=False)
+            remove_props.feature = feature
+            remove_props.version = selected
+
+            # What is loaded now against what the next start will load. Without this the only way to
+            # tell an install worked is to restart and hope.
+            running = dlss_library.active_version_at_startup(feature)
+            pending = dlss_library.active_version(feature)
+            if running is None and installed_text is not None:
+                # Installed the flat way, by an older add-on or by hand.
+                running = installed_text
+            if running is not None:
+                self._dlss_row(col, "").label(
+                    text=rpt_("In use: {:s}").format(running), translate=False)
+            if pending is not None and pending != running:
+                self._dlss_row(col, "").label(
+                    text=rpt_("After restart: {:s}").format(pending), translate=False)
+
+    @staticmethod
+    def _dlss_row(layout, label):
+        """One line of the block: right-aligned label, widgets returned to the caller.
+
+        Split by hand rather than through `use_property_split`, which puts only the first widget of
+        a row in the value column and leaves the rest of the row to fend for itself. The factor is
+        the one the property split itself uses, so these lines stay in the same two columns as the
+        settings above them.
+        """
+        split = layout.split(factor=0.4)
+        left = split.row()
+        left.alignment = 'RIGHT'
+        left.label(text=label, translate=False)
+        return split.row(align=True)
 
     def draw(self, context):
         self.draw_impl(self.layout, context)

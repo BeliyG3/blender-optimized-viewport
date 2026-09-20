@@ -53,6 +53,7 @@ class PathTraceWorkCPU : public PathTraceWork {
   int adaptive_sampling_converge_filter_count_active(const float threshold, bool reset) override;
   void cryptomatte_postproces() override;
   void denoise_volume_guiding_buffers() override;
+  void build_volume_froxel_grid() override;
 
 #if defined(WITH_PATH_GUIDING)
   /* Initializes the per-thread guiding kernel data. The function sets the pointers to the

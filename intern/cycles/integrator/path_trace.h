@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <functional>
 
 #include "integrator/denoiser.h"
@@ -66,9 +67,27 @@ class PathTrace {
    * render result. */
   bool ready_to_reset();
 
+  /* Diagnostic companion to `ready_to_reset()`. Zero means the UI thread has not completed a
+   * viewport redraw since the reset - the deferral is waiting on the redraw, which is where the
+   * overlays live. Non-zero with `ready_to_reset()` still false means the redraw did happen but
+   * found the texture outdated - the deferral is waiting on the render thread. */
+  int draws_after_reset() const
+  {
+    return draws_after_reset_;
+  }
+
   void reset(const BufferParams &full_params,
              const BufferParams &big_tile_params,
              bool reset_rendering);
+
+  /* Reset temporal denoiser history before its next evaluation. Multiple requests before an
+   * evaluation are intentionally coalesced. */
+  void request_denoiser_history_reset();
+
+  /* Keep the volume grid at full weight regardless of how many samples have settled. An
+   * offscreen capture of the moving viewport wants the picture the viewport shows while it moves,
+   * and that picture is the grid alone: the fade only starts once the view holds still. */
+  void set_volume_grid_hold(bool hold);
 
   void device_free();
 
@@ -92,6 +111,18 @@ class PathTrace {
    * Use this to configure the denoiser before rendering any samples. */
   void set_denoiser_params(const DenoiseParams &params);
 
+  /* Hand the denoiser a set of images allocated elsewhere, which it fills instead of allocating
+   * its own. Used when the model runs on the Vulkan side; an empty set goes back to the ordinary
+   * path. */
+  void set_denoiser_external_images(const DenoiserExternalImages &images);
+
+ private:
+  /* Ask the display side to take the denoising on, and give the denoiser the images it will fill.
+   * Public counterpart above is what the session calls; this is what the render loop uses. */
+  bool dlss_external_images_ensure();
+
+ public:
+
   /* Set parameters used for adaptive sampling.
    * Use this to configure the adaptive sampler before rendering any samples. */
   void set_adaptive_sampling(const AdaptiveSampling &adaptive_sampling);
@@ -110,7 +141,7 @@ class PathTrace {
   void zero_display();
 
   /* Perform drawing of the current state of the DisplayDriver. */
-  void draw();
+  bool draw();
 
   /* Flush outstanding display commands before ending the render loop. */
   void flush_display();
@@ -157,6 +188,8 @@ class PathTrace {
 
   /* Check whether denoiser was run and denoised passes are available. */
   bool has_denoised_result() const;
+  bool is_dlss_denoising() const;
+  bool dlss_runtime_failed() const;
 
   /* Get size and offset (relative to the buffer's full x/y) of the currently rendering tile.
    * In the case of tiled rendering this will return full-frame after all tiles has been rendered.
@@ -164,6 +197,7 @@ class PathTrace {
    * NOTE: If the full-frame buffer processing is in progress, returns parameters of the full-frame
    * instead. */
   int2 get_render_tile_size() const;
+  int2 get_render_tile_input_size() const;
   int2 get_render_tile_offset() const;
   int2 get_render_size() const;
 
@@ -214,6 +248,15 @@ class PathTrace {
   void adaptive_sample(RenderWork &render_work);
   void denoise(const RenderWork &render_work);
   void denoise_volume_guiding_buffers(const RenderWork &render_work, const bool has_volume);
+
+  /* Decide whether the camera-aligned volume grid is in use this frame, size it, and fill it.
+   * Runs before the trace, because the trace is what reads it. */
+  void build_volume_froxel_grid(const bool has_volume);
+
+  /* How far the grid's slices reach, and how much of the pixel it accounts for as the view settles
+   * back onto the traced result. */
+  float volume_froxel_far_distance();
+  float volume_froxel_blend();
   void cryptomatte_postprocess(const RenderWork &render_work);
   void update_display(const RenderWork &render_work);
   void rebalance(const RenderWork &render_work);
@@ -230,7 +273,7 @@ class PathTrace {
   void guiding_prepare_structures();
 
   /* Get number of samples in the current state of the render buffers. */
-  int get_num_samples_in_buffer();
+  int get_num_samples_in_buffer() const;
 
   /* Check whether user requested to cancel rendering, so that path tracing is to be finished as
    * soon as possible. */
@@ -288,7 +331,21 @@ class PathTrace {
   BufferParams big_tile_params_;
 
   /* Denoiser which takes care of denoising the big tile. */
+  /* Whether the model is running on the display side, and whether its history has to start over
+   * because the images it reads were just remade. */
+  bool dlss_external_active_ = false;
+  bool dlss_external_reset_ = true;
+
+  /* The camera of the frame being denoised, kept because the evaluation happens after the scope
+   * that builds it. Row-major 4x4, as the SDK expects. */
+  float dlss_world_to_view_[16] = {};
+  float dlss_view_to_clip_[16] = {};
+  bool dlss_have_camera_transforms_ = false;
+
   unique_ptr<Denoiser> denoiser_;
+  std::atomic_bool denoiser_history_reset_requested_ = false;
+
+  std::atomic_bool volume_grid_hold_ = false;
 
   /* Denoiser device descriptor which holds the denoised big tile for multi-device workloads. */
   unique_ptr<PathTraceWork> big_tile_denoise_work_;
@@ -353,9 +410,19 @@ class PathTrace {
     thread_condition_variable condition;
   } render_cancel_;
 
+  bool dlss_runtime_failed_ = false;
+
   /* Indicates whether a render result was drawn after latest session reset.
-   * Used by `ready_to_reset()` to implement logic which feels the most interactive. */
+   * Used by
+   * `ready_to_reset()` to implement logic which feels the most interactive. */
   bool did_draw_after_reset_ = true;
+
+  /* How many times the UI thread reached `draw()` since the last reset, whether or not the texture
+   * was fresh by then. `did_draw_after_reset_` alone cannot tell the two apart: it needs the UI
+   * thread to have finished a viewport redraw AND the render thread to have posted pixels, so a
+   * frame refused for "not ready" may be waiting on either. This separates them - see
+   * `draws_after_reset()`. */
+  int draws_after_reset_ = 0;
 
   /* State of the full frame processing and writing to the software. */
   struct {

@@ -6,9 +6,118 @@ from __future__ import annotations
 
 import bpy
 from bpy.types import Operator
-from bpy.props import StringProperty
+from bpy.props import EnumProperty, StringProperty
 
 from bpy.app.translations import pgettext_tip as tip_
+
+
+def _dlss_version_items(self, context):
+    """The versions this driver provides for the feature the operator was given.
+
+    The list itself, and the reason it has to outlive this call, are in `dlss_library`. `self` here
+    is the operator's properties rather than the operator, and `context` can be None.
+    """
+    from . import dlss_library
+
+    feature = getattr(self, "feature", "") or "dlssd"
+    if feature not in dlss_library.FEATURES:
+        feature = "dlssd"
+    return dlss_library.version_enum_items(feature)
+
+
+class CYCLES_OT_use_vulkan_next_launch(Operator):
+    bl_idname = "cycles.use_vulkan_next_launch"
+    bl_label = "Use Vulkan on Next Launch"
+    bl_description = (
+        "Save Vulkan as the GPU backend for the next Blender launch; "
+        "Blender will not restart automatically"
+    )
+
+    def execute(self, context):
+        system = context.preferences.system
+        if not hasattr(system, "gpu_backend"):
+            self.report({'ERROR'}, "This Blender build does not expose GPU backend preferences")
+            return {'CANCELLED'}
+
+        system.gpu_backend = 'VULKAN'
+        bpy.ops.wm.save_userpref()
+        self.report({'INFO'}, "Vulkan will be used after Blender is restarted")
+        return {'FINISHED'}
+
+
+class CYCLES_OT_install_dlss_library(Operator):
+    bl_idname = "cycles.install_dlss_library"
+    bl_label = "Install DLSS Library"
+    bl_description = (
+        "Copy the DLSS library the NVIDIA driver already installed into Blender's user folder, "
+        "under the name NGX looks for. Nothing is downloaded"
+    )
+
+    feature: StringProperty(
+        name="Feature",
+        description="Which NGX feature to install: dlssd for Ray Reconstruction, dlssg for "
+                    "Frame Generation",
+        default="dlssd",
+        options={'HIDDEN'},
+    )
+
+    version: EnumProperty(
+        name="Version",
+        description="Which driver-installed version to use. Newest first; a newer library is not "
+                    "always the better one",
+        items=_dlss_version_items,
+        options={'HIDDEN'},
+    )
+
+    def execute(self, context):
+        from . import dlss_library
+
+        # A dynamic enum takes no default, so an unset property is the first item - the newest
+        # version, which is what a plain button asking for no version in particular should get.
+        version = "" if self.version == 'NONE' else self.version
+
+        ok, message = dlss_library.install(self.feature, version)
+        if not ok:
+            self.report({'ERROR'}, message)
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, message)
+        return {'FINISHED'}
+
+
+class CYCLES_OT_remove_dlss_library(Operator):
+    bl_idname = "cycles.remove_dlss_library"
+    bl_label = "Remove DLSS Library"
+    bl_description = (
+        "Delete one installed DLSS library. The version this session is using cannot be deleted "
+        "while it runs - restart Blender first"
+    )
+
+    feature: StringProperty(
+        name="Feature",
+        description="Which NGX feature to remove: dlssd for Ray Reconstruction, dlssg for "
+                    "Frame Generation",
+        default="dlssd",
+        options={'HIDDEN'},
+    )
+
+    version: StringProperty(
+        name="Version",
+        description="Which installed version to delete",
+        default="",
+        options={'HIDDEN'},
+    )
+
+    def execute(self, context):
+        from . import dlss_library
+
+        ok, message = dlss_library.remove(self.feature, self.version)
+        if not ok:
+            self.report({'ERROR'}, message)
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, message)
+        return {'FINISHED'}
 
 
 class CYCLES_OT_use_shading_nodes(Operator):
@@ -149,6 +258,9 @@ class CYCLES_OT_merge_images(Operator):
 
 
 classes = (
+    CYCLES_OT_use_vulkan_next_launch,
+    CYCLES_OT_install_dlss_library,
+    CYCLES_OT_remove_dlss_library,
     CYCLES_OT_use_shading_nodes,
     CYCLES_OT_denoise_animation,
     CYCLES_OT_merge_images

@@ -36,6 +36,14 @@ static bool is_optix_specific_kernel(DeviceKernel kernel, bool osl_shading, bool
   (void)osl_camera;
 #  endif
 
+  /* Froxel injection walks the medium along a camera column, so it traces, and on OptiX tracing is
+   * only legal from a ray generation program. Kept out of `device_kernel_has_intersection` because
+   * the other back-ends read that list to decide their own dispatch and have no such restriction.
+   */
+  if (kernel == DEVICE_KERNEL_VOLUME_FROXEL_INJECT) {
+    return true;
+  }
+
   return device_kernel_has_intersection(kernel);
 }
 
@@ -186,6 +194,15 @@ bool OptiXDeviceQueue::enqueue(DeviceKernel kernel,
     case DEVICE_KERNEL_INTEGRATOR_INIT_FROM_CAMERA:
       pipeline = optix_device->pipelines[PIP_SHADE];
       sbt_params.raygenRecord = sbt_data_ptr + PG_RGEN_INIT_FROM_CAMERA * sizeof(SbtRecord);
+      break;
+
+    case DEVICE_KERNEL_VOLUME_FROXEL_INJECT:
+      /* The intersection pipeline, not the shading one: that one is only built when the scene asks
+       * for shader ray-tracing, MNEE or OSL, and the grid has to be fillable regardless. The
+       * launch size is the column count, so the kernel reads its column from the launch index and
+       * needs no argument. */
+      pipeline = optix_device->pipelines[PIP_INTERSECT];
+      sbt_params.raygenRecord = sbt_data_ptr + PG_RGEN_VOLUME_FROXEL_INJECT * sizeof(SbtRecord);
       break;
 
     default:

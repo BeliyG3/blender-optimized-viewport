@@ -753,6 +753,13 @@ bool VKTexture::allocate()
     image_info.pNext = &external_memory_create_info;
     external_memory_create_info.handleTypes = vk_external_memory_handle_type();
     allocCreateInfo.pool = device.vma_pools.external_memory_image.pool;
+    /* An allocation of its own, not a slice of a shared block.
+     *
+     * What is exported is the whole allocation, and the other API is told where inside it the
+     * image begins - but an API importing an image expects the allocation to be that image and
+     * nothing else, and turns down anything at a non-zero offset. Sub-allocating here is what made
+     * CUDA refuse these images with nothing but "invalid value". */
+    allocCreateInfo.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
   }
 
   if (G.debug & G_DEBUG_GPU) {

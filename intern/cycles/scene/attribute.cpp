@@ -10,6 +10,7 @@
 
 #include "util/guarded_allocator.h"
 #include "util/log.h"
+#include "util/string.h"
 #include "util/transform.h"
 
 CCL_NAMESPACE_BEGIN
@@ -256,6 +257,18 @@ static char *buffer_for_write(Attribute::Buffer &buf, const size_t element_size,
 
 char *Attribute::data_for_write_buffer(const int step)
 {
+  /* Handing out a writable pointer marks the attribute modified.
+   *
+   * Callers do write through it without setting the flag themselves - transforming vertex and corner
+   * normals in `Mesh::apply_transform`, filling tangents, copying motion steps. That was harmless
+   * while any change re-uploaded the whole attribute table, but the moment only the modified slices
+   * go to the device, a write with no flag means the device keeps the old data. An extra upload
+   * costs bandwidth; a missing one is a wrong image.
+   *
+   * Marking on access rather than on write means some callers that only read through the mutable
+   * accessor are marked too. That is the safe direction of the error. */
+  modified = true;
+
   if (step == 0) {
     if (!center.data) {
       assert(size == 0);
@@ -1085,20 +1098,68 @@ void AttributeSet::clear(bool preserve_voxel_data)
   }
 }
 
+/* Attributes that Cycles derives from other attributes rather than receiving from the scene.
+ *
+ * They are absent from a freshly synced attribute set, so the removal pass in `update()` used to
+ * drop them on every single geometry sync, and `GeometryManager::device_update` then regenerated
+ * them from scratch. On a scene whose geometry is driven by modifiers - so Blender reports it as
+ * re-evaluated on every frame even when the result is identical - that regeneration measured 545 ms
+ * per frame at 742 meshes, all of it spent recomputing data that had not changed.
+ *
+ * Tangents are derived from the positions, the normals and a UV map. Keeping them is only correct
+ * while none of those inputs was replaced with different data, which `update()` checks below. */
+static bool attribute_is_derived(const Attribute &attr)
+{
+  switch (attr.std) {
+    case ATTR_STD_UV_TANGENT:
+    case ATTR_STD_UV_TANGENT_SIGN:
+    case ATTR_STD_UV_TANGENT_UNDISPLACED:
+    case ATTR_STD_UV_TANGENT_SIGN_UNDISPLACED:
+      return true;
+    default:
+      break;
+  }
+
+  /* Tangents for a non-standard UV map are named after that map plus a suffix, and carry no
+   * standard - see `Mesh::update_tangents`. */
+  if (attr.std != ATTR_STD_NONE) {
+    return false;
+  }
+  const string &name = attr.name.string();
+  return string_endswith(name, ".tangent") || string_endswith(name, ".tangent_sign") ||
+         string_endswith(name, ".undisplaced_tangent") ||
+         string_endswith(name, ".undisplaced_tangent_sign");
+}
+
+/* Whether an attribute is one a derived attribute is computed from. */
+static bool attribute_is_derivation_input(const Attribute &attr)
+{
+  switch (attr.std) {
+    case ATTR_STD_POSITION:
+    case ATTR_STD_VERTEX_NORMAL:
+    case ATTR_STD_CORNER_NORMAL:
+    case ATTR_STD_UV:
+      return true;
+    default:
+      /* Any corner-element float2 is a UV map that tangents may have been generated for. */
+      return attr.type == TypeFloat2 && attr.element == ATTR_ELEMENT_CORNER;
+  }
+}
+
 void AttributeSet::update(AttributeSet &&new_attributes)
 {
-  /* Remove any attributes not on new_attributes. */
-  list<Attribute>::iterator it;
-  for (it = attributes.begin(); it != attributes.end();) {
-    const Attribute &old_attr = *it;
-    if (new_attributes.find_matching(old_attr) == nullptr) {
-      remove(it++);
-      continue;
+  /* Which of our attributes the new set does not carry. Collected before the add pass below, since
+   * that pass moves the new attributes out and `find_matching` would then see empty data. Iterators
+   * into a list stay valid across insertions, so they can be acted on afterwards. */
+  vector<list<Attribute>::iterator> missing;
+  for (list<Attribute>::iterator it = attributes.begin(); it != attributes.end(); ++it) {
+    if (new_attributes.find_matching(*it) == nullptr) {
+      missing.push_back(it);
     }
-    it++;
   }
 
   /* Add or update old_attributes based on the new_attributes. */
+  bool derivation_inputs_changed = false;
   for (Attribute &attr : new_attributes.attributes) {
     const Attribute *new_attr = add_from(std::move(attr));
 
@@ -1108,6 +1169,19 @@ void AttributeSet::update(AttributeSet &&new_attributes)
     {
       geometry->tag_modified();
     }
+
+    if (new_attr->modified && attribute_is_derivation_input(*new_attr)) {
+      derivation_inputs_changed = true;
+    }
+  }
+
+  /* Remove the attributes the new set does not carry, except derived ones whose inputs all came
+   * back unchanged - those are still valid and regenerating them is the expensive part. */
+  for (list<Attribute>::iterator it : missing) {
+    if (!derivation_inputs_changed && attribute_is_derived(*it)) {
+      continue;
+    }
+    remove(it);
   }
 
   /* If all attributes were replaced, transform is no longer applied. */

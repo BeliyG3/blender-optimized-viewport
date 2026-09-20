@@ -7,6 +7,9 @@
  */
 
 #include <cstdio>
+#include <cstdlib>
+
+#include "BLI_time.h"
 
 #include "CLG_log.h"
 
@@ -808,6 +811,70 @@ bool is_object_instancer(const Object &ob)
 {
   return (ob.transflag & OB_DUPLI) || (ob.runtime->geometry_set_eval != nullptr);
 }
+
+/**
+ * Where the time goes inside #foreach_obref_in_scene.
+ *
+ * In Rendered mode with an external engine the populate loop still runs whenever overlays are on,
+ * and on an instance-heavy scene that walk is the single most expensive thing in the frame. Timers
+ * sit around whole loops, never inside them: a clock read per instance would cost more than the
+ * work it measures.
+ *
+ * Gated on `BLENDER_DEBUG_DUPLI_STATS`; costs one predictable branch when off.
+ */
+struct DupliWalkStats {
+  /* Generating the DupliObject records for one instancer. */
+  double duplilist = 0.0;
+  /* Per-instance visibility test, negative-scale test, key hashing, map insert - and, for
+   * instances that cannot share a handle range, their whole temporary-object sync. */
+  double group = 0.0;
+  /* One temporary object plus one engine sync per InstancesKey. */
+  double sync_group = 0.0;
+  /* The whole walk, including the top-level depsgraph iterator. */
+  double total = 0.0;
+  int64_t instances = 0;
+  int64_t visible = 0;
+  /* Instances that failed #supports_handle_ranges and were synced one by one. */
+  int64_t singles = 0;
+  int64_t groups = 0;
+  int64_t instancers = 0;
+  int64_t toplevel = 0;
+  int calls = 0;
+};
+
+static DupliWalkStats g_dupli_stats;
+
+static bool dupli_stats_enabled()
+{
+  static const bool enabled = std::getenv("BLENDER_DEBUG_DUPLI_STATS") != nullptr;
+  return enabled;
+}
+
+static void dupli_stats_report()
+{
+  DupliWalkStats &s = g_dupli_stats;
+  if (++s.calls < 120) {
+    return;
+  }
+  const double n = double(s.calls);
+  printf(
+      "DUPLI_WALK total=%.2f duplilist=%.2f group=%.2f sync_group=%.2f "
+      "unaccounted=%.2f | toplevel=%.0f instancers=%.0f instances=%.0f visible=%.0f "
+      "singles=%.0f groups=%.0f\n",
+      s.total / n * 1000.0,
+      s.duplilist / n * 1000.0,
+      s.group / n * 1000.0,
+      s.sync_group / n * 1000.0,
+      (s.total - s.duplilist - s.group - s.sync_group) / n * 1000.0,
+      double(s.toplevel) / n,
+      double(s.instancers) / n,
+      double(s.instances) / n,
+      double(s.visible) / n,
+      double(s.singles) / n,
+      double(s.groups) / n);
+  fflush(stdout);
+  s = DupliWalkStats();
+}
 }  // namespace
 
 /**
@@ -849,6 +916,9 @@ static void foreach_obref_in_scene(
   Object tmp_object;
   bke::ObjectRuntime tmp_runtime;
 
+  const bool stats = dupli_stats_enabled();
+  const double stats_start = stats ? BLI_time_now_seconds() : 0.0;
+
   Depsgraph *depsgraph = draw_ctx.depsgraph;
   eEvaluationMode eval_mode = DEG_get_mode(depsgraph);
   View3D *v3d = draw_ctx.v3d;
@@ -866,6 +936,8 @@ static void foreach_obref_in_scene(
     if (!DEG_iterator_object_is_visible(eval_mode, ob)) {
       continue;
     }
+
+    g_dupli_stats.toplevel += stats;
 
     const int visibility = BKE_object_visibility(ob, eval_mode);
     const bool ob_visible = visibility & (OB_VISIBLE_SELF | OB_VISIBLE_PARTICLES);
@@ -901,19 +973,29 @@ static void foreach_obref_in_scene(
     }
 
     /* Generate and walk this instancer's duplis. */
+    const double t_duplilist = stats ? BLI_time_now_seconds() : 0.0;
     duplilist.clear();
     object_duplilist(draw_ctx.depsgraph, ob, deg_iter_settings.included_objects, duplilist);
+
+    if (stats) {
+      g_dupli_stats.duplilist += BLI_time_now_seconds() - t_duplilist;
+      g_dupli_stats.instancers += 1;
+      g_dupli_stats.instances += duplilist.size();
+    }
 
     if (duplilist.is_empty()) {
       continue;
     }
 
+    const double t_group = stats ? BLI_time_now_seconds() : 0.0;
     dupli_map.clear();
     for (DupliObject &dupli : duplilist) {
 
       if (!DEG_iterator_dupli_is_visible(&dupli, eval_mode)) {
         continue;
       }
+
+      g_dupli_stats.visible += stats;
 
       /* TODO: Optimize.
        * We can't check the dupli.ob since visibility may be different than the dupli itself.
@@ -925,6 +1007,7 @@ static void foreach_obref_in_scene(
 #endif
 
       if (!supports_handle_ranges(&dupli, ob, draw_ctx)) {
+        g_dupli_stats.singles += stats;
         /* Sync the dupli as a single object. */
         if (!evil::DEG_iterator_temp_object_from_dupli(
                 ob, &dupli, eval_mode, false, &tmp_object, &tmp_runtime) ||
@@ -959,6 +1042,12 @@ static void foreach_obref_in_scene(
       dupli_map.lookup_or_add_default(key).append(&dupli);
     }
 
+    const double t_sync_group = stats ? BLI_time_now_seconds() : 0.0;
+    if (stats) {
+      g_dupli_stats.group += t_sync_group - t_group;
+      g_dupli_stats.groups += dupli_map.size();
+    }
+
     for (const auto &[key, instances] : dupli_map.items()) {
       DupliObject *first_dupli = instances.first();
       if (!evil::DEG_iterator_temp_object_from_dupli(
@@ -982,8 +1071,17 @@ static void foreach_obref_in_scene(
 
       evil::DEG_iterator_temp_object_free_properties(first_dupli, &tmp_object);
     }
+
+    if (stats) {
+      g_dupli_stats.sync_group += BLI_time_now_seconds() - t_sync_group;
+    }
   }
   DEG_OBJECT_ITER_END;
+
+  if (stats) {
+    g_dupli_stats.total += BLI_time_now_seconds() - stats_start;
+    dupli_stats_report();
+  }
 }
 
 }  // namespace draw
@@ -1035,6 +1133,77 @@ void DRW_cache_free_old_batches(Main *bmain)
 /** \name Rendering (DRW_engines)
  * \{ */
 
+/**
+ * Where the time goes in one viewport redraw, past the instance walk.
+ *
+ * The walk is only the first half of the cost: what follows is extracting the geometry batches for
+ * every instance source, letting each engine finish its sync, and then the draw itself - which for
+ * an external engine includes rasterising the whole scene again just to fill the depth buffer.
+ *
+ * Shares the `BLENDER_DEBUG_DUPLI_STATS` switch with #DupliWalkStats so one run reports both.
+ */
+struct DrawPhaseStats {
+  double sync = 0.0;      /* engines_init_and_sync: init, begin_sync, the walk, end_sync */
+  double extract = 0.0;   /* geometry batches for the instance sources */
+  double draw = 0.0;      /* engines_draw_scene, including the forced depth prepass */
+  double callbacks = 0.0; /* pre_scene and post_scene: gizmos, text, annotations */
+  double total = 0.0;
+  int calls = 0;
+
+  /* How much of the redraw work is a recomputation of something that did not change.
+   *
+   * The depth prepass output depends on exactly three things: the evaluated scene, the projection,
+   * and the region size. Every redraw that matches the previous one on all three rebuilds a depth
+   * buffer identical to the one just discarded - and with DLSS that happens several times per
+   * displayed frame, because each accumulation iteration and each generated frame triggers its own
+   * redraw. `reusable` is the share a depth cache would serve. */
+  int64_t scene_changes = 0;
+  int64_t reusable = 0;
+};
+
+static DrawPhaseStats g_draw_phase_stats;
+
+/** Everything the depth prepass result depends on. */
+struct DepthPrepassKey {
+  uint64_t scene_revision = 0;
+  float persmat[4][4] = {};
+  int width = 0;
+  int height = 0;
+  bool valid = false;
+
+  bool operator==(const DepthPrepassKey &other) const
+  {
+    return valid && other.valid && scene_revision == other.scene_revision &&
+           width == other.width && height == other.height &&
+           memcmp(persmat, other.persmat, sizeof(persmat)) == 0;
+  }
+};
+
+static DepthPrepassKey g_last_depth_key;
+
+static void drw_phase_stats_report()
+{
+  DrawPhaseStats &s = g_draw_phase_stats;
+  if (++s.calls < 120) {
+    return;
+  }
+  const double n = double(s.calls);
+  printf(
+      "DRAW_PHASES total=%.2f sync=%.2f (extract=%.2f) draw=%.2f callbacks=%.2f | "
+      "redraws=%d scene_changes=%.0f reusable=%.0f (%.0f%%)\n",
+      s.total / n * 1000.0,
+      s.sync / n * 1000.0,
+      s.extract / n * 1000.0,
+      s.draw / n * 1000.0,
+      s.callbacks / n * 1000.0,
+      s.calls,
+      double(s.scene_changes),
+      double(s.reusable),
+      double(s.reusable) / n * 100.0);
+  fflush(stdout);
+  s = DrawPhaseStats();
+}
+
 static void drw_engines_cache_populate(draw::ObjectRef &ref,
                                        DupliCacheManager &dupli_cache,
                                        ExtractionGraph &extraction)
@@ -1069,6 +1238,9 @@ void DRWContext::sync(iter_callback_t iter_callback)
   /* Custom callback defines the set of object to sync. */
   iter_callback(dupli_handler, extraction);
 
+  const bool stats = draw::dupli_stats_enabled();
+  const double t_extract = stats ? BLI_time_now_seconds() : 0.0;
+
   dupli_handler.extract_all(extraction);
   for (Object *object : this->delayed_extraction) {
     draw::drw_batch_cache_generate_requested_evaluated_mesh_or_curve(object, *extraction.graph);
@@ -1076,6 +1248,10 @@ void DRWContext::sync(iter_callback_t iter_callback)
   this->delayed_extraction.clear();
 
   extraction.work_and_wait();
+
+  if (stats) {
+    g_draw_phase_stats.extract += BLI_time_now_seconds() - t_extract;
+  }
 
   DRW_curves_update(*view_data_active->manager);
 }
@@ -1552,6 +1728,30 @@ static void drw_draw_render_loop_3d(DRWContext &draw_ctx, RenderEngineType *engi
     return BKE_object_is_visible_in_viewport(v3d, &ob) ? DrawFilter::Draw : DrawFilter::Skip;
   };
 
+  const bool stats = dupli_stats_enabled();
+  const double t_start = stats ? BLI_time_now_seconds() : 0.0;
+
+  if (stats) {
+    DepthPrepassKey key;
+    key.scene_revision = DEG_get_update_count(depsgraph);
+    if (draw_ctx.rv3d) {
+      memcpy(key.persmat, draw_ctx.rv3d->persmat, sizeof(key.persmat));
+    }
+    if (draw_ctx.region) {
+      key.width = draw_ctx.region->winx;
+      key.height = draw_ctx.region->winy;
+    }
+    key.valid = true;
+
+    if (key == g_last_depth_key) {
+      g_draw_phase_stats.reusable += 1;
+    }
+    if (key.scene_revision != g_last_depth_key.scene_revision) {
+      g_draw_phase_stats.scene_changes += 1;
+    }
+    g_last_depth_key = key;
+  }
+
   draw_ctx.enable_engines(gpencil_engine_needed, engine_type);
   draw_ctx.engines_data_validate();
   draw_ctx.engines_init_and_sync([&](DupliCacheManager &duplis, ExtractionGraph &extraction) {
@@ -1563,14 +1763,27 @@ static void drw_draw_render_loop_3d(DRWContext &draw_ctx, RenderEngineType *engi
     }
   });
 
+  const double t_sync_end = stats ? BLI_time_now_seconds() : 0.0;
+
   /* No frame-buffer allowed before drawing. */
   BLI_assert(GPU_framebuffer_active_get() == GPU_framebuffer_back_get());
   GPU_framebuffer_bind(draw_ctx.default_framebuffer());
   GPU_framebuffer_clear_depth_stencil(draw_ctx.default_framebuffer(), 1.0f, 0xFF);
 
   drw_callbacks_pre_scene(draw_ctx);
+  const double t_draw = stats ? BLI_time_now_seconds() : 0.0;
   draw_ctx.engines_draw_scene();
+  const double t_draw_end = stats ? BLI_time_now_seconds() : 0.0;
   drw_callbacks_post_scene(draw_ctx);
+
+  if (stats) {
+    const double now = BLI_time_now_seconds();
+    g_draw_phase_stats.sync += t_sync_end - t_start;
+    g_draw_phase_stats.draw += t_draw_end - t_draw;
+    g_draw_phase_stats.callbacks += (t_draw - t_sync_end) + (now - t_draw_end);
+    g_draw_phase_stats.total += now - t_start;
+    drw_phase_stats_report();
+  }
 
   if (WM_draw_region_get_bound_viewport(draw_ctx.region)) {
     /* Don't unbind the frame-buffer yet in this case and let

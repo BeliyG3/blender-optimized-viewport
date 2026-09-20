@@ -4,10 +4,12 @@
 
 #include "integrator/path_trace_tile.h"
 #include "integrator/pass_accessor_cpu.h"
+#include "integrator/pass_resampler.h"
 #include "integrator/path_trace.h"
 
 #include "scene/pass.h"
 #include "session/buffers.h"
+#include "util/vector.h"
 
 CCL_NAMESPACE_BEGIN
 
@@ -42,7 +44,9 @@ bool PathTraceTile::get_pass_pixels(const string_view pass_name,
     return false;
   }
 
-  const bool has_denoised_result = path_trace_.has_denoised_result() ||
+  const bool has_denoised_result = (path_trace_.has_denoised_result() &&
+                                    (!path_trace_.is_dlss_denoising() ||
+                                     pass->type == PASS_COMBINED)) ||
                                    is_volume_guiding_pass(pass->type);
   if (pass->mode == PassMode::DENOISED && !has_denoised_result) {
     pass = buffer_params.find_pass(pass->type);
@@ -67,10 +71,37 @@ bool PathTraceTile::get_pass_pixels(const string_view pass_name,
   pass_access_info.use_approximate_shadow_catcher_background =
       pass_access_info.use_approximate_shadow_catcher && !buffer_params.use_transparent_background;
 
-  const PassAccessorCPU pass_accessor(pass_access_info, exposure, num_samples);
-  const PassAccessor::Destination destination(pixels, num_channels);
+  const int2 input_size = path_trace_.get_render_tile_input_size();
+  const int2 output_size = path_trace_.get_render_tile_size();
+  pass_access_info.set_upscaled_denoised(input_size != output_size);
 
-  return path_trace_.get_render_tile_pixels(pass_accessor, destination);
+  const PassAccessorCPU pass_accessor(pass_access_info, exposure, num_samples);
+  const bool combined_dlss_output = pass->type == PASS_COMBINED &&
+                                    pass->mode == PassMode::DENOISED && has_denoised_result;
+  if (input_size == output_size || combined_dlss_output) {
+    const PassAccessor::Destination destination(pixels, num_channels);
+    return path_trace_.get_render_tile_pixels(pass_accessor, destination);
+  }
+
+  if (!PassResampler::can_resample(pass->type)) {
+    return false;
+  }
+
+  vector<float> input_pixels(size_t(input_size.x) * input_size.y * num_channels);
+  const PassAccessor::Destination input_destination(input_pixels.data(), num_channels);
+  if (!path_trace_.get_render_tile_pixels(pass_accessor, input_destination)) {
+    return false;
+  }
+
+  PassResampler::resample(pass->type,
+                          input_pixels.data(),
+                          input_size.x,
+                          input_size.y,
+                          pixels,
+                          output_size.x,
+                          output_size.y,
+                          num_channels);
+  return true;
 }
 
 bool PathTraceTile::set_pass_pixels(const string_view pass_name,

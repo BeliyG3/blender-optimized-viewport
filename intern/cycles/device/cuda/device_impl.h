@@ -61,6 +61,9 @@ class CUDADevice : public GPUDevice {
   /* All memory types. */
   void mem_alloc(device_memory &mem) override;
   void mem_copy_to(device_memory &mem) override;
+  void mem_copy_to_range(device_memory &mem,
+                         const size_t offset_bytes,
+                         const size_t size_bytes) override;
   void mem_move_to_host(device_memory &mem) override;
   void mem_copy_from(
       device_memory &mem, const size_t y, size_t w, const size_t h, size_t elem) override;

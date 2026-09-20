@@ -107,6 +107,15 @@ class BVHParams {
   /* These are needed for Embree. */
   int curve_subdivisions;
 
+  /* Whether per-object motion transforms are to be used for instances.
+   *
+   * Object motion arrays are also populated for the interactive motion pass, which the denoiser
+   * consumes but the kernel does not trace: with motion blur off, rays carry a fixed time and an
+   * instance built with two motion keys would be traced somewhere between the two transforms.
+   * The other backends gate on the same condition - see `usesMotionBlur` in the OptiX device and
+   * `motion_blur` in the Metal and HIP-RT ones. */
+  bool use_object_motion;
+
   /* fixed parameters */
   enum { MAX_DEPTH = 64, MAX_SPATIAL_DEPTH = 48, NUM_SPATIAL_BINS = 32 };
 
@@ -142,6 +151,7 @@ class BVHParams {
     bvh_type = 0;
 
     curve_subdivisions = 4;
+    use_object_motion = false;
   }
 
   /* SAH costs */

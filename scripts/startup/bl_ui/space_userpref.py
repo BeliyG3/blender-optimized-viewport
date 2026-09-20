@@ -750,6 +750,7 @@ class USERPREF_PT_system_display_graphics(SystemPanel, CenterAlignMixIn, Panel):
 
         col = layout.column()
         col.prop(system, "gpu_backend", text="Backend")
+        col.prop(system, "vsync")
         if system.gpu_backend == 'VULKAN':
             col = layout.column()
             col.enabled = gpu.platform.backend_type_get() == 'VULKAN'

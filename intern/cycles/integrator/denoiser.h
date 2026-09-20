@@ -9,6 +9,7 @@
 
 #include <functional>
 
+#include "integrator/denoiser_external_images.h"
 #include "device/denoise.h"
 #include "device/device.h"
 #include "util/unique_ptr.h"
@@ -20,6 +21,8 @@ class Device;
 class GraphicsInteropDevice;
 class RenderBuffers;
 class Progress;
+
+bool use_dlss_denoiser(Device *denoiser_device, const DenoiseParams &params);
 
 bool use_optix_denoiser(Device *denoiser_device, const DenoiseParams &params);
 
@@ -58,6 +61,8 @@ class Denoiser {
   void set_params(const DenoiseParams &params);
   const DenoiseParams &get_params() const;
 
+  static bool is_device_supported(DenoiserType type, const DeviceInfo &denoise_device_info);
+
   /* Recommended type for viewport denoising. */
   static DenoiserType automatic_viewport_denoiser_type(const DeviceInfo &denoise_device_info);
 
@@ -66,6 +71,58 @@ class Denoiser {
    *
    * NOTE: The `progress` is an optional argument, can be nullptr. */
   virtual bool load_kernels(Progress *progress);
+
+  /* Reset temporal history before the next denoising evaluation.
+   *
+   * Stateless denoisers
+   * intentionally ignore this. Temporal denoisers override it so callers do
+   * not need to know
+   * the concrete implementation type. */
+  virtual void reset_history() {}
+
+  /* Temporarily replace motion inputs with zeroes without modifying the Vector passes stored in
+
+   * * the render buffer. Used for same-scene-time refinement evaluations. */
+  virtual void set_zero_motion(bool /*zero_motion*/) {}
+
+  /* Where the camera is this frame, for a denoiser that asks for it.
+   *
+   * A temporal network is handed depth and motion in screen space and has no way to know what
+   * those numbers mean in the world without the transforms that produced them. NGX takes both as
+   * optional inputs; the CUDA path never filled them in. Row-major 4x4, as the SDK expects.
+   *
+   * Denoisers that do not use them ignore this. */
+  virtual void set_camera_transforms(const float /*world_to_view*/[16],
+                                     const float /*view_to_clip*/[16])
+  {
+  }
+
+  /* Images allocated elsewhere, for the denoiser to fill instead of allocating its own.
+   *
+   * The model of DLSS 4.5 does not run on the CUDA path of NGX - it refuses every evaluation,
+   * before anything reaches the GPU - so the evaluation happens on the Vulkan side instead. The
+   * inputs are still produced here, by the kernels that always produced them; what changes is that
+   * the memory they write into belongs to Vulkan, and both APIs see the same pixels.
+   *
+   * A denoiser that does not take part in this ignores it. */
+  virtual void set_external_images(const DenoiserExternalImages & /*images*/) {}
+
+  /* Whether the denoiser is actually filling external images this frame. False after a set was
+   * offered and could not be mapped, which puts everything back on the ordinary path. */
+  virtual bool external_images_active() const
+  {
+    return false;
+  }
+
+  /* Run the model that lives outside this denoiser, once the inputs are written.
+   *
+   * Called from inside the denoise pass, between the kernels that fill the shared images and the
+   * kernel that reads the result, because that is the only order in which the result exists when it
+   * is needed. Returns whether the frame was denoised. */
+  /* The argument is whether the history is to be discarded before this evaluation: a reset asked
+   * of the denoiser has to reach the model wherever the model runs. */
+  using ExternalEvaluate = std::function<bool(bool reset_history)>;
+  virtual void set_external_evaluate(ExternalEvaluate /*evaluate*/) {}
 
   /* Denoise the entire buffer.
    *

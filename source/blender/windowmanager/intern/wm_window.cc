@@ -1010,9 +1010,12 @@ static void wm_window_ghostwindow_add(wmWindowManager *wm,
   GPUBackendType gpu_backend = GPU_backend_type_selection_get();
   gpu_settings.context_type = wm_ghost_drawing_context_type(gpu_backend);
   gpu_settings.preferred_device = GPU_backend_preferred_device_get();
-  if (GPU_backend_vsync_is_overridden()) {
-    gpu_settings.flags |= GHOST_gpuVSyncIsOverridden;
-    gpu_settings.vsync = GHOST_TVSyncModes(GPU_backend_vsync_get());
+  {
+    const GHOST_TVSyncModes vsync = wm_window_vsync_mode();
+    if (vsync != GHOST_kVSyncModeUnset) {
+      gpu_settings.flags |= GHOST_gpuVSyncIsOverridden;
+      gpu_settings.vsync = vsync;
+    }
   }
 
   int posx = 0;
@@ -2917,6 +2920,52 @@ void wm_window_set_swap_interval(wmWindow *win, int interval)
 {
   GHOST_IWindow *ghost_window = static_cast<GHOST_IWindow *>(win->runtime->ghostwin);
   ghost_window->setSwapInterval(interval);
+}
+
+GHOST_TVSyncModes wm_window_vsync_mode()
+{
+  /* The command line wins: `--gpu-vsync` is how a measurement pins the mode regardless of what
+   * the preferences say. */
+  if (GPU_backend_vsync_is_overridden()) {
+    return GHOST_TVSyncModes(GPU_backend_vsync_get());
+  }
+
+  /* "On" is what the context does when told nothing - MAILBOX on Vulkan, the driver's default on
+   * OpenGL - so it stays unset rather than becoming a request, and a preferences file from before
+   * the setting changes nothing. Strict is a Vulkan notion: FIFO over MAILBOX. On OpenGL the value
+   * is a swap interval, and two would mean every second refresh, so there it reads as on. */
+  switch (U.vsync_mode) {
+    case USER_VSYNC_OFF:
+      return GHOST_kVSyncModeOff;
+    case USER_VSYNC_STRICT:
+      return (GPU_backend_type_selection_get() == GPU_BACKEND_VULKAN) ? GHOST_kVSyncModeStrict :
+                                                                        GHOST_kVSyncModeUnset;
+    case USER_VSYNC_ON:
+      break;
+  }
+  return GHOST_kVSyncModeUnset;
+}
+
+void WM_windows_vsync_update(wmWindowManager *wm)
+{
+  if (wm == nullptr) {
+    return;
+  }
+  GHOST_TVSyncModes vsync = wm_window_vsync_mode();
+  const bool vulkan = GPU_backend_type_selection_get() == GPU_BACKEND_VULKAN;
+  if (vsync == GHOST_kVSyncModeUnset) {
+    if (!vulkan) {
+      /* There is nothing to hand an OpenGL context to get the driver's default back. */
+      return;
+    }
+    /* On Vulkan unset and on select the same present mode; the context needs a value to move to. */
+    vsync = GHOST_kVSyncModeOn;
+  }
+  for (wmWindow &win : wm->windows) {
+    if (win.runtime && win.runtime->ghostwin) {
+      wm_window_set_swap_interval(&win, int(vsync));
+    }
+  }
 }
 
 bool wm_window_get_swap_interval(wmWindow *win, int *r_interval)

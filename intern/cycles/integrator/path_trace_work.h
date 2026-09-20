@@ -132,6 +132,10 @@ class PathTraceWork {
   /* Denoise Volume Scattering Probability Guiding buffers. */
   virtual void denoise_volume_guiding_buffers() = 0;
 
+  /* Fill the camera-aligned volume grid for this frame: what the medium is in every cell, then the
+   * same integrated front to back so a ray segment costs two lookups. */
+  virtual void build_volume_froxel_grid() = 0;
+
   /* Run cryptomatte pass post-processing kernels. */
   virtual void cryptomatte_postproces() = 0;
 

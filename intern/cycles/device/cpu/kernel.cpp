@@ -32,6 +32,8 @@ CPUKernels::CPUKernels()
       /* Volume Scattering Probability Guiding. */
       REGISTER_KERNEL(volume_guiding_filter_x),
       REGISTER_KERNEL(volume_guiding_filter_y),
+      /* Camera-aligned volume grid. */
+      REGISTER_KERNEL(volume_froxel_inject),
       /* Cryptomatte. */
       REGISTER_KERNEL(cryptomatte_postprocess),
       /* Film Convert. */

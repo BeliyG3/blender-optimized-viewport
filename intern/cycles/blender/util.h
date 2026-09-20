@@ -786,6 +786,23 @@ static inline bool region_view3d_navigating_or_transforming(const blender::Regio
                     (blender::G.moving & (blender::G_TRANSFORM_OBJ | blender::G_TRANSFORM_EDIT)));
 }
 
+/* Whether the user is actively changing the view: navigating, transforming objects, playing the
+ * timeline or scrubbing it. Used to give the viewport a reduced sample budget while the image is
+ * moving anyway, and let it accumulate once things settle.
+ *
+ * `animtimer` and `scrubbing` mirror what `ED_screen_animation_playing()` checks, but only for the
+ * screen this session belongs to - Cycles has no dependency on the editor module, and reading the
+ * two DNA fields directly avoids adding one. The consequence is that playback started in a
+ * different window than the 3D viewport does not engage the budget. */
+static inline bool viewport_interaction_active(const blender::bScreen *b_screen,
+                                               const blender::RegionView3D *b_rv3d)
+{
+  if (region_view3d_navigating_or_transforming(b_rv3d)) {
+    return true;
+  }
+  return b_screen && (b_screen->animtimer != nullptr || b_screen->scrubbing);
+}
+
 class EdgeMap {
  public:
   EdgeMap() = default;

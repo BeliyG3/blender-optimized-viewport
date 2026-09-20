@@ -12,6 +12,8 @@
 
 #include "DNA_windowmanager_enums.h"
 
+#include "GHOST_Types.hh"
+
 namespace blender {
 
 struct bContext;
@@ -117,6 +119,8 @@ void wm_window_set_size(wmWindow *win, int width, int height);
 void wm_window_swap_buffer_acquire(wmWindow *win);
 void wm_window_swap_buffer_release(wmWindow *win);
 void wm_window_set_swap_interval(wmWindow *win, int interval);
+/** The VSync mode a window's context should use: the command line override, else the preference. */
+GHOST_TVSyncModes wm_window_vsync_mode();
 bool wm_window_get_swap_interval(wmWindow *win, int *r_interval);
 
 bool wm_cursor_position_get(wmWindow *win, int *r_x, int *r_y) ATTR_WARN_UNUSED_RESULT;

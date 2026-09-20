@@ -26,6 +26,8 @@ CCL_NAMESPACE_BEGIN
 
 using thread_mutex = std::mutex;
 using thread_scoped_lock = std::unique_lock<std::mutex>;
+/* For the scene mutex, which callers wait on with a timeout rather than giving up. */
+using thread_scoped_timed_lock = std::unique_lock<std::timed_mutex>;
 using thread_condition_variable = std::condition_variable;
 
 /**

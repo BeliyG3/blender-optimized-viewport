@@ -607,6 +607,30 @@ void CUDADevice::mem_copy_to(device_memory &mem)
   }
 }
 
+void CUDADevice::mem_copy_to_range(device_memory &mem,
+                                   const size_t offset_bytes,
+                                   const size_t size_bytes)
+{
+  /* Images carry a binding that describes the contents, so a range copy would leave it stale.
+   * Anything not yet allocated has nothing to patch either. */
+  if (mem.type == MEM_IMAGE_TEXTURE || !mem.device_pointer || !mem.is_resident(this)) {
+    mem_copy_to(mem);
+    return;
+  }
+
+  generic_copy_to_range(mem, offset_bytes, size_bytes);
+
+  if (mem.type == MEM_GLOBAL) {
+    /* A global is bound by writing its pointer into kernel parameters, and the pointer is what a
+     * range copy leaves alone - so the binding survives. Rewritten anyway to keep this identical to
+     * the full upload path, which costs a few bytes of constant memory.
+     *
+     * This used to fall back to a full upload out of caution, which quietly turned every partial
+     * scene upload into a whole-array one: all the scene arrays are globals. */
+    const_copy_to(mem.global_name(), &mem.device_pointer, sizeof(mem.device_pointer));
+  }
+}
+
 void CUDADevice::mem_move_to_host(device_memory &mem)
 {
   if (mem.type == MEM_GLOBAL) {

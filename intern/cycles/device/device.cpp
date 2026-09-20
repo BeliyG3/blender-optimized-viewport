@@ -883,6 +883,26 @@ void GPUDevice::generic_copy_to(device_memory &mem)
   }
 }
 
+void GPUDevice::generic_copy_to_range(device_memory &mem,
+                                      const size_t offset_bytes,
+                                      const size_t size_bytes)
+{
+  if (!mem.host_pointer || !mem.device_pointer || size_bytes == 0) {
+    return;
+  }
+
+  /* A shared allocation needs no copy at all: host and device see the same memory. */
+  if (mem.is_shared(this) && mem.host_pointer == mem.shared_pointer) {
+    return;
+  }
+
+  assert(offset_bytes + size_bytes <= mem.memory_size());
+
+  copy_host_to_device((void *)(mem.device_pointer + offset_bytes),
+                      (char *)mem.host_pointer + offset_bytes,
+                      size_bytes);
+}
+
 bool GPUDevice::is_shared(const void *shared_pointer,
                           const device_ptr device_pointer,
                           Device * /*sub_device*/)

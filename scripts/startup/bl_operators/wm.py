@@ -3505,7 +3505,18 @@ class WM_MT_splash_about(Menu):
 
         col = split.column(align=True)
         col.scale_y = 0.8
-        col.label(text=iface_("Version: {:s}").format(bpy.app.version_string), translate=False)
+        col.label(
+            text=iface_("Version: {:s}").format(
+                f"{bpy.app.version_string} - DLSS Experimental"
+            ),
+            translate=False,
+        )
+        col.label(text="Base: fbe6228777e7", translate=False)
+        col.label(
+            text="Custom revision: {:s}".format(bpy.app.build_hash.decode("ascii")),
+            translate=False,
+        )
+        col.label(text="DLSS upstream: faf95b020a50", translate=False)
         col.separator(factor=2.5)
         col.label(text=iface_("Date: {:s} {:s}").format(
             bpy.app.build_commit_date.decode("utf-8", "replace"),

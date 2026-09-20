@@ -6,6 +6,7 @@
  * \ingroup render
  */
 
+#include <climits>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -127,6 +128,11 @@ RenderEngine *RE_engine_create(RenderEngineType *type)
 {
   RenderEngine *engine = MEM_new_zeroed<RenderEngine>("RenderEngine");
   engine->type = type;
+
+  /* Zero is a valid frame number, so "no frame captured yet" needs a value that cannot be mistaken
+   * for one. The rest of the offscreen capture fields are right at zero: no capture, no wait. */
+  engine->viewport_offscreen_frame = INT_MIN;
+  engine->viewport_offscreen_synced = false;
 
   BLI_mutex_init(&engine->update_render_passes_mutex);
   BLI_mutex_init(&engine->blender_gpu_context_mutex);
@@ -654,7 +660,9 @@ bool RE_engine_use_persistent_data(RenderEngine *engine)
 {
   /* Re-rendering is not supported with GPU contexts, since the GPU context
    * is destroyed when the render thread exists. */
-  return (engine->re->r.mode & R_PERSISTENT_DATA) && !(engine->type->flag & RE_USE_GPU_CONTEXT);
+  return ((engine->re->r.mode & R_PERSISTENT_DATA) ||
+          (engine->flag & RE_ENGINE_FORCE_PERSISTENT_DATA)) &&
+         !(engine->type->flag & RE_USE_GPU_CONTEXT);
 }
 
 static bool engine_keep_depsgraph(RenderEngine *engine)
@@ -663,7 +671,9 @@ static bool engine_keep_depsgraph(RenderEngine *engine)
    * view layers and animation frames. For renderers like Cycles that create
    * their own copy of the scene, persistent data must be explicitly enabled to
    * keep memory usage low by default. */
-  return (engine->re->r.mode & R_PERSISTENT_DATA) || (engine->type->flag & RE_USE_GPU_CONTEXT);
+  return (engine->re->r.mode & R_PERSISTENT_DATA) ||
+         (engine->flag & RE_ENGINE_FORCE_PERSISTENT_DATA) ||
+         (engine->type->flag & RE_USE_GPU_CONTEXT);
 }
 
 /* Depsgraph */
@@ -1078,6 +1088,9 @@ bool RE_engine_render(Render *re, bool do_all)
 
   if (re->flag & R_ANIMATION) {
     engine->flag |= RE_ENGINE_ANIMATION;
+  }
+  if (re->flag & R_FRAME_SEQUENCE) {
+    engine->flag |= RE_ENGINE_FRAME_SEQUENCE;
   }
   if (re->r.scemode & R_BUTS_PREVIEW) {
     engine->flag |= RE_ENGINE_PREVIEW;

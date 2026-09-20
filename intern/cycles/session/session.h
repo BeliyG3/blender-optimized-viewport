@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <functional>
 
 #include "device/device.h"
@@ -46,6 +47,10 @@ class SessionParams {
   bool background;
 
   int samples;
+  /* Sample count the viewport stops at while the user is interacting. Zero disables the reduced
+   * budget. Only honoured for viewport DLSS, where every sample is an independent temporal input
+   * and stopping early is what makes playback responsive. */
+  int interactive_samples;
   bool use_sample_subset;
   int sample_subset_offset;
   int sample_subset_length;
@@ -74,6 +79,7 @@ class SessionParams {
     background = false;
 
     samples = 1024;
+    interactive_samples = 0;
     use_sample_subset = false;
     sample_subset_offset = 0;
     sample_subset_length = 1024;
@@ -134,20 +140,52 @@ class Session {
    * for the buffer to be uniformly sampled. */
   void cancel(bool quick = false);
 
-  void draw();
+  /* Returns whether the draw found a fresh texture waiting - the value the display already
+   * produces, which was thrown away here. An offscreen capture needs it: "the engine drew" and
+   * "the engine drew this frame's pixels" are different facts. */
+  bool draw();
   void wait();
 
   bool ready_to_reset();
+
+  /* Diagnostic: how many viewport redraws completed since the last reset. Tells apart the two
+   * reasons `ready_to_reset()` can be false - see `PathTrace::draws_after_reset()`. */
+  int draws_after_reset();
+
+  /* Whether everything scheduled for the current scene state has been traced and posted for
+   * display. Safe to call from the draw thread. */
+  bool is_render_complete() const
+  {
+    return render_complete_.load(std::memory_order_acquire);
+  }
+
   void reset(const SessionParams &session_params, const BufferParams &buffer_params);
+  void request_denoiser_history_reset();
 
   void set_pause(bool pause);
-  void set_navigating(bool navigating);
+
+  /* Report whether the user is actively changing the view - navigating, transforming, playing or
+   * scrubbing the timeline. Drives image cache eviction, and lets the render scheduler fall back to
+   * a reduced sample budget while the image is moving anyway.
+   *
+   * Called from the draw thread; the value is picked up by the session thread once per iteration. */
+  void set_interaction_state(bool interacting);
+
+  /* Hold the volume grid at full weight - see `PathTrace::set_volume_grid_hold`. */
+  void set_volume_grid_hold(bool hold);
 
   void set_samples(const int samples);
   void set_time_limit(const double time_limit);
 
+  /* Number of samples to stop at while `set_interaction_state(true)` is in effect. Zero disables
+   * the reduced budget and always renders up to the full sample count. */
+  void set_interactive_samples(const int samples);
+
   void set_output_driver(unique_ptr<OutputDriver> driver);
   void set_display_driver(unique_ptr<DisplayDriver> driver);
+
+  /* Give the denoiser images allocated by the display side, for a model that runs there. */
+  void set_denoiser_external_images(const DenoiserExternalImages &images);
 
   double get_estimated_remaining_time() const;
 
@@ -158,6 +196,7 @@ class Session {
   float get_progress();
 
   void collect_statistics(RenderStats *stats);
+  bool dlss_runtime_failed() const;
 
   /* --------------------------------------------------------------------
    * Full-frame on-disk storage.
@@ -234,6 +273,40 @@ class Session {
 
   bool pause_ = false;
   bool new_work_added_ = false;
+
+  /* Written from the draw thread by `set_interaction_state()`, read by the session thread in
+   * `run_update_for_next_iteration()`. */
+  std::atomic<bool> is_interacting_ = false;
+
+  /* Whether the scheduler has run out of work for the current buffer state: every scheduled sample
+   * traced and the final display update posted. Written by the session thread, read by the draw
+   * thread through `is_render_complete()`.
+   *
+   * Deliberately not `RenderScheduler::done()`, which comes earlier: at `done()` the scheduler
+   * still hands out post-processing work that includes a display update, so a frame reported
+   * complete there would not yet be on screen. "No work left" is the point where it truly is. */
+  std::atomic<bool> render_complete_ = false;
+
+  /* When the current accumulation started, for reporting how long a pose actually takes, and how
+   * many have started. Session thread only. Compared against the number that finish: if far fewer
+   * finish than start, playback is showing partly accumulated frames. */
+  double pose_started_ = 0.0;
+  int pose_starts_ = 0;
+
+  /* How much of `LOOP update` was waiting for the scene lock rather than updating the scene. The
+   * lock is taken inside the timed region, so the two were indistinguishable, and reading the sum
+   * as work is what made "where did the freed milliseconds go" unanswerable. Session thread only,
+   * reset with the rest of the window. */
+  double loop_lock_wait_ms_ = 0.0;
+
+  /* How long `Session::reset` spends inside `PathTrace::cancel()`. That call runs on the main
+   * thread with the scene lock held, so it stops the whole UI; the question is whether it returns
+   * at once or waits out a render iteration. Main thread only, diagnostic. */
+  int cancel_calls_ = 0;
+  int cancel_nonzero_ = 0;
+  double cancel_total_ms_ = 0.0;
+  double cancel_max_ms_ = 0.0;
+  int cancel_histogram_[12] = {};
 
   thread_condition_variable pause_cond_;
   thread_mutex pause_mutex_;

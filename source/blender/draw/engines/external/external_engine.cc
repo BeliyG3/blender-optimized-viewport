@@ -9,17 +9,23 @@
  * We use it for depth and non-mesh objects.
  */
 
+#include "BKE_context.hh"
+#include "BKE_main.hh"
 #include "BKE_paint.hh"
 #include "DRW_engine.hh"
 #include "DRW_render.hh"
 
+#include "BLI_listbase.h"
 #include "BLI_string.h"
 
 #include "BLT_translation.hh"
 
+#include "DEG_depsgraph_query.hh"
+
 #include "DNA_particle_types.h"
 #include "DNA_screen_types.h"
 #include "DNA_view3d_types.h"
+#include "DNA_windowmanager_types.h"
 
 #include "ED_image.hh"
 #include "ED_render.hh"
@@ -29,9 +35,12 @@
 #include "GPU_debug.hh"
 #include "GPU_matrix.hh"
 #include "GPU_state.hh"
+#include "GPU_viewport.hh"
 
 #include "RE_engine.h"
 #include "RE_pipeline.h"
+
+#include "WM_api.hh"
 
 #include "draw_cache.hh"
 #include "draw_cache_impl.hh"
@@ -228,11 +237,65 @@ class Instance : public DrawEngine {
 
   void end_sync() final {}
 
+  /* A context for the engine callbacks of an offscreen draw, which arrives with none.
+   *
+   * A viewport render or playblast draws the interactive session into an offscreen buffer, and
+   * `ED_view3d_draw_offscreen_imbuf` hands the draw manager no context at all. The engine
+   * callbacks then fall back to whatever the main thread's global context happens to point at,
+   * which is only the right 3D view by luck. Build the one they need, the way the render update
+   * does for `view_update` (`render_update.cc`): the window and area that own this very region and
+   * this very 3D view. Null when no such area exists - the render display type can replace the 3D
+   * view's space - and then the draw goes on exactly as it did before. */
+  static bContext *offscreen_engine_context_create(const DRWContext *draw_ctx)
+  {
+    Main *bmain = DEG_get_bmain(draw_ctx->depsgraph);
+    wmWindowManager *wm = static_cast<wmWindowManager *>(bmain->wm.first);
+    if (wm == nullptr) {
+      return nullptr;
+    }
+    for (wmWindow &window : wm->windows) {
+      bScreen *screen = WM_window_get_active_screen(&window);
+      if (screen == nullptr) {
+        continue;
+      }
+      for (ScrArea &area : screen->areabase) {
+        if (area.spacedata.first != draw_ctx->v3d) {
+          continue;
+        }
+        if (BLI_findindex(&area.regionbase, draw_ctx->region) == -1) {
+          continue;
+        }
+        bContext *C = CTX_create();
+        CTX_data_main_set(C, bmain);
+        CTX_data_scene_set(C, DEG_get_input_scene(draw_ctx->depsgraph));
+        CTX_wm_manager_set(C, wm);
+        CTX_wm_window_set(C, &window);
+        CTX_wm_screen_set(C, screen);
+        CTX_wm_area_set(C, &area);
+        CTX_wm_region_set(C, draw_ctx->region);
+
+        return C;
+      }
+    }
+    return nullptr;
+  }
+
   void draw_scene_do_v3d(draw::Manager &manager, draw::View &view)
   {
     RegionView3D *rv3d = draw_ctx->rv3d;
     ARegion *region = draw_ctx->region;
 
+    /* An offscreen draw is a capture of this view, not the view itself. It runs from a job that
+     * never told the engine the frame changed - the depsgraph update refuses to call
+     * `view_update` off the main thread - so here, with a context of its own, it is told. And
+     * here rather than earlier because this is the one place `rv3d` already carries the offscreen
+     * matrices: a sync done before this point sees the region's camera, the draw after it sees
+     * the capture's, and the engine treats the difference as a camera move on every frame. */
+    const bool offscreen = draw_ctx->is_viewport_image_render();
+    bContext *private_context = (offscreen && draw_ctx->evil_C == nullptr) ?
+                                    offscreen_engine_context_create(draw_ctx) :
+                                    nullptr;
+    const bContext *C = (private_context != nullptr) ? private_context : draw_ctx->evil_C;
     draw::command::StateSet::set(DRW_STATE_WRITE_COLOR);
 
     /* The external engine can use the OpenGL rendering API directly, so make sure the state is
@@ -251,10 +314,19 @@ class Instance : public DrawEngine {
 
       rv3d->view_render = RE_NewViewRender(engine_type);
       render_engine = RE_view_engine_get(rv3d->view_render);
-      engine_type->view_update(render_engine, draw_ctx->evil_C, draw_ctx->depsgraph);
+      render_engine->viewport_offscreen = offscreen;
+      engine_type->view_update(render_engine, C, draw_ctx->depsgraph);
     }
     else {
       render_engine = RE_view_engine_get(rv3d->view_render);
+      render_engine->viewport_offscreen = offscreen;
+      /* Once per frame, not on every draw: a capture probes this path several times while it
+       * waits for the engine's frame, and the update is a full pass over the scene's objects
+       * for an engine like Cycles - measured at most of an 85 ms probe on a heavy scene, five
+       * times a frame. The engine says when it has the frame; until it does, every draw asks. */
+      if (offscreen && C != nullptr && !render_engine->viewport_offscreen_synced) {
+        render_engine->type->view_update(render_engine, C, draw_ctx->depsgraph);
+      }
     }
 
     /* Rendered draw. */
@@ -263,8 +335,21 @@ class Instance : public DrawEngine {
     ED_region_pixelspace(region);
 
     /* Render result draw. */
+    /* The interactive viewport is the one that presents frames, and the only one frame generation
+     * has any business with: an offscreen buffer is read back, never shown, and handing it over
+     * had the engine's frame generation scheduler driven by draws that never present. */
     const RenderEngineType *type = render_engine->type;
-    type->view_draw(render_engine, draw_ctx->evil_C, draw_ctx->depsgraph);
+    render_engine->viewport = offscreen ? nullptr : draw_ctx->viewport;
+    if (!offscreen && render_engine->viewport_frame_generation_hold_last_real) {
+      GPU_viewport_frame_generation_hold_last_real(draw_ctx->viewport);
+    }
+    type->view_draw(render_engine, C, draw_ctx->depsgraph);
+    render_engine->viewport = nullptr;
+    render_engine->viewport_offscreen = false;
+
+    if (private_context != nullptr) {
+      CTX_free(private_context);
+    }
 
     GPU_matrix_pop();
     GPU_matrix_pop_projection();
@@ -402,10 +487,12 @@ class Instance : public DrawEngine {
 
     const DefaultFramebufferList *dfbl = draw_ctx->viewport_framebuffer_list_get();
 
-    /* Will be nullptr during OpenGL render.
-     * OpenGL render is used for quick preview (thumbnails or sequencer preview)
-     * where using the rendering engine to preview doesn't make so much sense. */
-    if (draw_ctx->evil_C) {
+    /* The context is null during a viewport render. Upstream draws nothing then - "OpenGL render
+     * is used for quick preview where using the rendering engine doesn't make so much sense" -
+     * which is exactly why a playblast of a Rendered viewport came out empty: the engine was never
+     * asked. A viewport render of a 3D view is that view captured, so the engine draws it, with the
+     * context `draw_scene_do_v3d` builds for the purpose. The image editor keeps the old rule. */
+    if (draw_ctx->evil_C || (draw_ctx->is_viewport_image_render() && draw_ctx->v3d != nullptr)) {
       /* This is to keep compatibility with external engine. */
       /* TODO(fclem): remove it eventually. */
       GPU_framebuffer_bind(dfbl->default_fb);

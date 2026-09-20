@@ -6,6 +6,8 @@
  * \ingroup overlay
  */
 
+#include <cstdlib>
+
 #include "BKE_colorband.hh"
 #include "DEG_depsgraph_query.hh"
 
@@ -84,6 +86,16 @@ void Instance::init()
     /* For depth only drawing, no other render engine is expected. Except for Grease Pencil which
      * outputs valid depth. Otherwise depth is cleared and is valid. */
     state.is_render_depth_available |= state.is_depth_only_drawing;
+
+    /* Diagnostic switch, not an option. The test above is a whitelist of engine names, not a
+     * question about depth, so with Cycles the whole scene is rasterised again every frame purely
+     * to fill the depth buffer - on top of the path-traced image the engine already produced.
+     * Claiming the depth is there skips that rasterisation and measures what it costs. The
+     * overlays then sort against whatever the depth buffer happens to hold, so the picture is
+     * wrong: this exists to put a number on the prepass, nothing else. */
+    if (std::getenv("BLENDER_DEBUG_OVERLAY_ASSUME_DEPTH") != nullptr) {
+      state.is_render_depth_available = true;
+    }
 
     if (!state.hide_overlays) {
       state.overlay = state.v3d->overlay;

@@ -145,4 +145,11 @@ void KERNEL_FUNCTION_FULL_NAME(volume_guiding_filter_y)(const ThreadKernelGlobal
                                                         const int offset,
                                                         int stride);
 
+/* --------------------------------------------------------------------
+ * Camera-aligned volume grid.
+ */
+
+void KERNEL_FUNCTION_FULL_NAME(volume_froxel_inject)(const ThreadKernelGlobalsCPU *kg,
+                                                     const int column_index);
+
 #undef KERNEL_ARCH

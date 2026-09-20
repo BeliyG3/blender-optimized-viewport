@@ -20,6 +20,8 @@
 #include "kernel/integrator/intersect_subsurface.h"
 #include "kernel/integrator/intersect_volume_stack.h"
 #include "kernel/integrator/intersect_dedicated_light.h"
+
+#include "kernel/integrator/volume_froxel.h"
 // clang-format on
 
 extern "C" __global__ void __raygen__kernel_optix_integrator_intersect_closest()
@@ -56,6 +58,14 @@ extern "C" __global__ void __raygen__kernel_optix_integrator_intersect_volume_st
                              kernel_params.path_index_array[global_index] :
                              global_index;
   integrator_intersect_volume_stack(nullptr, path_index);
+}
+
+/* One thread per column of the froxel grid. Tracing is what forces this to be a ray generation
+ * program rather than a plain CUDA kernel like the rest of the grid work. The launch is sized to
+ * the column count, so the index needs no bound check and the kernel takes no argument. */
+extern "C" __global__ void __raygen__kernel_optix_volume_froxel_inject()
+{
+  volume_froxel_inject(nullptr, optixGetLaunchIndex().x);
 }
 
 extern "C" __global__ void __raygen__kernel_optix_integrator_intersect_dedicated_light()

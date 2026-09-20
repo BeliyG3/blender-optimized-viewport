@@ -18,6 +18,7 @@
 #include "BKE_material.hh"
 #include "DNA_light_types.h"
 #include "DNA_material_types.h"
+#include "DNA_mesh_types.h"
 
 CCL_NAMESPACE_BEGIN
 
@@ -108,9 +109,6 @@ Geometry *BlenderSync::sync_geometry(BObjectInfo &b_ob_info,
                                     b_ob_info.object_data;
   const GeometryKey key(b_key_id, geom_type);
 
-  /* Find shader indices. */
-  array<Node *> used_shaders = find_used_shaders(*b_ob_info.iter_object);
-
   /* Ensure we only sync instanced geometry once. */
   Geometry *geom = geometry_map.find(key);
   if (geom) {
@@ -118,6 +116,27 @@ Geometry *BlenderSync::sync_geometry(BObjectInfo &b_ob_info,
       return geom;
     }
   }
+
+  /* Diagnostics: how many geometries Blender actually re-evaluated this frame, and how large they
+   * are. The size decides whether the pool wait is repacking work at all: `create_mesh` runs its
+   * loops over corners, and the parallel ones only engage past a threshold. If four dirty
+   * geometries turn out to be small, the wait is something else - converting curves to meshes, most
+   * likely - and lowering that threshold would buy nothing. Read from the Blender mesh rather than
+   * the Cycles one, because the sync that fills the latter may still be queued. */
+  if (geometry_map.check_recalc(b_key_id)) {
+    sync_stats_geometry_dirty++;
+    if (b_ob_info.object_data && GS(b_ob_info.object_data->name) == blender::ID_ME) {
+      sync_stats_geometry_corners += reinterpret_cast<const blender::Mesh *>(
+                                         b_ob_info.object_data)
+                                         ->corners_num;
+    }
+  }
+
+  /* Find shader indices. Kept below the early return, though that return fires less often than it
+   * looks: geometry that needs no sync leaves further down, before it is ever recorded as synced,
+   * so every instance of an unchanged geometry still arrives here. Moving the lookup measured as
+   * no change - it is cheap when a geometry has one material slot. */
+  array<Node *> used_shaders = find_used_shaders(*b_ob_info.iter_object);
 
   /* Test if we need to sync. */
   bool sync = true;
@@ -195,7 +214,32 @@ Geometry *BlenderSync::sync_geometry(BObjectInfo &b_ob_info,
       return;
     }
 
+    /* What the walk actually waits for. `SYNC_OBJECTS wait=` measures 4.8 ms per frame on a scene
+     * where only four geometries change, which on a 24-core machine is either one geometry that
+     * dominates or four that start too late to overlap the walk. Those two want opposite fixes -
+     * splitting the copy of a single mesh, or queueing the tasks earlier - so the line below
+     * reports both the duration and when the task ran, against the same clock as `SYNC_OBJECTS`. */
+    static const bool report_task = getenv("CYCLES_DEBUG_VIEWPORT_PHASES") != nullptr;
+    const double task_started = report_task ? time_dt() : 0.0;
+
     progress.set_sync_status("Synchronizing object", BKE_id_name(b_ob_info.real_object->id));
+
+    struct TaskReport {
+      const bool &enabled;
+      const double &started;
+      const Geometry *geom;
+      ~TaskReport()
+      {
+        if (enabled) {
+          fprintf(stderr,
+                  "GEOM_TASK name=%s type=%d began=%.2f ms=%.2f\n",
+                  geom->name.c_str(),
+                  int(geom->geometry_type),
+                  started * 1000.0,
+                  (time_dt() - started) * 1000.0);
+        }
+      }
+    } task_report{report_task, task_started, geom};
 
     if (geom->is_light()) {
       Light *light = static_cast<Light *>(geom);
@@ -224,6 +268,10 @@ Geometry *BlenderSync::sync_geometry(BObjectInfo &b_ob_info,
     task_pool->push(sync_func);
   }
   else {
+    /* No pool means this repacking runs on the main thread, inside the walk rather than beside it.
+     * Counted because instances are denied the pool wholesale, so if a dirty geometry first appears
+     * as an instance its entire mesh copy lands here. */
+    sync_stats_geometry_synced_inline++;
     sync_func();
   }
 

@@ -114,9 +114,12 @@ void BlenderSync::sync_background_light(blender::bScreen *b_screen, blender::Vie
     else {
       geom = scene->create_light_node<BackgroundLight>();
       geometry_map.add(geom_key, geom);
-      object->set_geometry(geom);
       update = true;
     }
+    /* Assigned on both branches. It used to happen only where the geometry was created, so a newly
+     * created object paired with a surviving geometry - the two live in separate maps and are swept
+     * separately - ended up with no geometry at all, which the rest of the scene assumes it has. */
+    object->set_geometry(geom);
 
     if (update || world_recalc || b_world != world_map) {
       /* Initialize light geometry. */

@@ -136,6 +136,7 @@ KERNEL_STRUCT_MEMBER(film, int, pass_denoising_normal)
 KERNEL_STRUCT_MEMBER(film, int, pass_denoising_roughness)
 KERNEL_STRUCT_MEMBER(film, int, pass_denoising_depth)
 KERNEL_STRUCT_MEMBER(film, int, pass_denoising_backward_motion)
+KERNEL_STRUCT_MEMBER(film, int, pass_denoising_specular_motion)
 KERNEL_STRUCT_MEMBER(film, int, denoising_pass_options_flag)
 /* AOVs. */
 KERNEL_STRUCT_MEMBER(film, int, pass_aov_color)
@@ -235,8 +236,117 @@ KERNEL_STRUCT_MEMBER(integrator, int, use_volume_guiding)
 KERNEL_STRUCT_MEMBER(integrator, int, use_guiding_direct_light)
 KERNEL_STRUCT_MEMBER(integrator, int, use_guiding_mis_weights)
 
+/* Volume scattering probability guiding (VSPG), driven by environment variables so a whole sweep
+ * costs one build. See Integrator::device_update for the variables and their defaults.
+ *
+ * These exist because under DLSS the guiding never has data: the render buffer is cleared before
+ * every iteration and the guiding filter runs after the trace, so the guide passes read zero and
+ * the probability collapses to a constant. Whether that constant is better or worse than the
+ * analytic attenuation is a measurement, not an argument - hence the switches.
+ *
+ * DONT_SPECIALIZE: these change between runs, and specializing on them would rebuild the kernels
+ * on every flip. The block must stay a multiple of 16 bytes, hence the pad. */
+KERNEL_STRUCT_MEMBER_DONT_SPECIALIZE
+KERNEL_STRUCT_MEMBER(integrator, int, volume_scatter_guiding)
+KERNEL_STRUCT_MEMBER_DONT_SPECIALIZE
+KERNEL_STRUCT_MEMBER(integrator, float, volume_scatter_probability_override)
+KERNEL_STRUCT_MEMBER_DONT_SPECIALIZE
+KERNEL_STRUCT_MEMBER(integrator, float, volume_scatter_guiding_mix)
+/* Which denoising features a surface with no BSDF closures (pure emission) publishes:
+ *   bit 0  the geometric normal
+ *   bit 1  roughness, as fully rough
+ *   bit 2  withhold emission and background from the denoising albedo pass, so that the hint
+ *          stays reflectance rather than becoming radiance - see film_write_emission_or_
+ *          background_pass for why that matters across a silhouette
+ *   bit 3  compress that contribution instead of withholding it, so emitters of different
+ *          brightness stop arriving as the same fully saturated hue
+ * Zero is upstream behaviour.
+ * A knob rather than a constant because the passes accumulate across samples: in a pixel where
+ * some paths scatter in the fog and others reach the emitter behind it, the two normals add, and
+ * a guide buffer that is itself noisy is worse than one that is merely incomplete. */
+KERNEL_STRUCT_MEMBER_DONT_SPECIALIZE
+KERNEL_STRUCT_MEMBER(integrator, int, denoising_emissive_features)
+
 KERNEL_STRUCT_MEMBER(integrator, float2, pixel_jitter)
 KERNEL_STRUCT_END(KernelIntegrator)
+
+/* Volume froxel grid.
+ *
+ * A camera-aligned grid holding the volume's emission and extinction, integrated front to back so
+ * that any segment of a camera ray costs two lookups. It replaces the stochastic volume while the
+ * viewport is being interacted with: one sample per pixel through a dense medium is noise, and the
+ * grid is the same answer without the variance.
+ *
+ * Every member changes with the camera or the viewport size, so none of them may be specialized
+ * into the kernel. */
+KERNEL_STRUCT_BEGIN(KernelVolumeFroxel, froxel)
+/* Zero when the grid is not in use - then nothing below is read. */
+KERNEL_STRUCT_MEMBER_DONT_SPECIALIZE
+KERNEL_STRUCT_MEMBER(froxel, int, enabled)
+/* How much of the pixel the grid accounts for, 1 while interacting and falling to 0 once the camera
+ * settles, so the honest path trace takes over without a step in the picture. */
+KERNEL_STRUCT_MEMBER_DONT_SPECIALIZE
+KERNEL_STRUCT_MEMBER(froxel, float, blend)
+KERNEL_STRUCT_MEMBER_DONT_SPECIALIZE
+KERNEL_STRUCT_MEMBER(froxel, int, res_x)
+KERNEL_STRUCT_MEMBER_DONT_SPECIALIZE
+KERNEL_STRUCT_MEMBER(froxel, int, res_y)
+KERNEL_STRUCT_MEMBER_DONT_SPECIALIZE
+KERNEL_STRUCT_MEMBER(froxel, int, res_z)
+/* Pixels per froxel along X and Y. */
+KERNEL_STRUCT_MEMBER_DONT_SPECIALIZE
+KERNEL_STRUCT_MEMBER(froxel, int, tile)
+/* The depth range the slices span, distributed exponentially between them. */
+KERNEL_STRUCT_MEMBER_DONT_SPECIALIZE
+KERNEL_STRUCT_MEMBER(froxel, float, t_near)
+KERNEL_STRUCT_MEMBER_DONT_SPECIALIZE
+KERNEL_STRUCT_MEMBER(froxel, float, t_far)
+/* How much of the injection to actually run, for bisecting a fault down to the step that causes
+ * it: 0 all of it, 1 write a constant, 2 also generate the camera ray, 3 also walk the hulls. Set
+ * from CYCLES_FROXEL_STAGE. */
+KERNEL_STRUCT_MEMBER_DONT_SPECIALIZE
+KERNEL_STRUCT_MEMBER(froxel, int, stage)
+/* What the user asked for, as opposed to `enabled`, which is what the frame can actually deliver -
+ * the grid needs a viewport and a scene with a medium in it. */
+KERNEL_STRUCT_MEMBER_DONT_SPECIALIZE
+KERNEL_STRUCT_MEMBER(froxel, int, requested)
+/* Whether the grid keeps standing in once the view settles, instead of fading back to the traced
+ * result over the following frames. */
+KERNEL_STRUCT_MEMBER_DONT_SPECIALIZE
+KERNEL_STRUCT_MEMBER(froxel, int, always)
+/* How far the slices reach if the user said so; zero takes it from the volume bounds below. */
+KERNEL_STRUCT_MEMBER_DONT_SPECIALIZE
+KERNEL_STRUCT_MEMBER(froxel, float, user_distance)
+/* Light samples per cell. Zero leaves the medium unlit - it still blocks and glows, but nothing
+ * shines through it - which is what the grid did before and what the lit version is measured
+ * against. Set from CYCLES_FROXEL_LIGHT_SAMPLES. */
+KERNEL_STRUCT_MEMBER_DONT_SPECIALIZE
+KERNEL_STRUCT_MEMBER(froxel, int, light_samples)
+/* Which corrections to the grid's lighting are switched on, one per bit. Each is a departure from
+ * what the grid did originally, and each is measured against the traced result on its own - so
+ * they have to be separable at run time rather than at build time. Set from CYCLES_FROXEL_FIX;
+ * see `VolumeFroxelFix` in `kernel/types.h`. */
+KERNEL_STRUCT_MEMBER_DONT_SPECIALIZE
+KERNEL_STRUCT_MEMBER(froxel, int, fixes)
+/* Where between the least and the greatest density inside an octree node the walk towards a light
+ * takes its answer. Half way is the obvious choice and not the right one: a node holding both a
+ * wisp and the empty space around it averages to more than the ray actually crosses. Set from
+ * CYCLES_FROXEL_SIGMA_MIX. */
+KERNEL_STRUCT_MEMBER_DONT_SPECIALIZE
+KERNEL_STRUCT_MEMBER(froxel, float, shadow_sigma_mix)
+/* How much of the multiple scattering the grid puts back, as a fraction of what the physics says.
+ * One means all of it; the knob is there to turn it down, not to fit it. Set from
+ * CYCLES_FROXEL_MULTI_SCATTER. */
+KERNEL_STRUCT_MEMBER_DONT_SPECIALIZE
+KERNEL_STRUCT_MEMBER(froxel, float, multi_scatter_return)
+/* Where the media of the scene are, so the slices can reach exactly that far. `w` is one when the
+ * bounds are known and zero when the scene holds no volume at all. Written by the object manager,
+ * which is the one place that sees the volume objects with their final bounds. */
+KERNEL_STRUCT_MEMBER_DONT_SPECIALIZE
+KERNEL_STRUCT_MEMBER(froxel, float4, bounds_min)
+KERNEL_STRUCT_MEMBER_DONT_SPECIALIZE
+KERNEL_STRUCT_MEMBER(froxel, float4, bounds_max)
+KERNEL_STRUCT_END(KernelVolumeFroxel)
 
 /* Image. */
 

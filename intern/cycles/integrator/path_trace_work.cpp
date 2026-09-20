@@ -134,14 +134,26 @@ void PathTraceWork::copy_from_denoised_render_buffers(const RenderBuffers *rende
 bool PathTraceWork::get_render_tile_pixels(const PassAccessor &pass_accessor,
                                            const PassAccessor::Destination &destination)
 {
-  const int offset_y = (effective_buffer_params_.full_y + effective_buffer_params_.window_y) -
-                       (effective_big_tile_params_.full_y + effective_big_tile_params_.window_y);
-  const int width = effective_buffer_params_.width;
+  const bool use_denoised_size = pass_accessor.get_pass_access_info().mode == PassMode::DENOISED &&
+                                 (effective_denoised_buffer_params_.width !=
+                                      effective_buffer_params_.width ||
+                                  effective_denoised_buffer_params_.height !=
+                                      effective_buffer_params_.height);
+  const BufferParams &effective_big_tile_params = use_denoised_size ?
+                                                      effective_denoised_big_tile_params_ :
+                                                      effective_big_tile_params_;
+  const BufferParams &effective_buffer_params = use_denoised_size ?
+                                                    effective_denoised_buffer_params_ :
+                                                    effective_buffer_params_;
+  const int offset_y = (effective_buffer_params.full_y + effective_buffer_params.window_y) -
+                       (effective_big_tile_params.full_y + effective_big_tile_params.window_y);
+  const int width = effective_buffer_params.width;
 
   PassAccessor::Destination slice_destination = destination;
   slice_destination.offset += offset_y * width;
 
-  return pass_accessor.get_render_tile_pixels(buffers_.get(), slice_destination);
+  return pass_accessor.get_render_tile_pixels(
+      buffers_.get(), effective_buffer_params, slice_destination);
 }
 
 bool PathTraceWork::set_render_tile_pixels(PassAccessor &pass_accessor,
@@ -188,15 +200,9 @@ PassAccessor::PassAccessInfo PathTraceWork::get_display_pass_access_info(PassMod
   pass_access_info.use_approximate_shadow_catcher_background =
       kfilm.use_approximate_shadow_catcher && !kbackground.transparent;
 
-  if (pass_access_info.mode == PassMode::DENOISED &&
-      (effective_denoised_buffer_params_.width != effective_buffer_params_.width ||
-       effective_denoised_buffer_params_.height != effective_buffer_params_.height))
-  {
-    /* Avoid using sample count to filter pass after upscaling, since it is stored at a different
-     * resolution. The denoiser should have applied scaling again in this case. */
-    pass_access_info.use_sample_count = false;
-    pass_access_info.use_approximate_shadow_catcher_background = false;
-  }
+  pass_access_info.set_upscaled_denoised(
+      effective_denoised_buffer_params_.width != effective_buffer_params_.width ||
+      effective_denoised_buffer_params_.height != effective_buffer_params_.height);
 
   pass_access_info.show_active_pixels = film_->get_show_active_pixels();
 

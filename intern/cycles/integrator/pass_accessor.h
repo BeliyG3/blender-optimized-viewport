@@ -41,6 +41,27 @@ class PassAccessor {
     bool use_approximate_shadow_catcher_background = false;
 
     bool show_active_pixels = false;
+
+    /* Adjust for a denoised pass that was upscaled, which is to say one whose result is stored at
+     * a different resolution than the render it came from.
+     *
+     * The sample count is written at the render resolution, so reading it at the resolution of the
+     * result addresses a pixel that was never rendered - and a zero sample count makes the reader
+     * return a fully zeroed pixel: black and transparent. The denoiser has already applied the
+     * scaling in this case, so the count is not needed for anything.
+     *
+     * Called by every reader of such a pass. It lives here because it did not: the display path
+     * had this rule and the path that writes the file did not, so a rendered frame came out with
+     * everything above `render_height^2 / output_height` empty, while the same frame on screen was
+     * whole. */
+    void set_upscaled_denoised(bool upscaled)
+    {
+      if (!upscaled || mode != PassMode::DENOISED) {
+        return;
+      }
+      use_sample_count = false;
+      use_approximate_shadow_catcher_background = false;
+    }
   };
 
   class Destination {

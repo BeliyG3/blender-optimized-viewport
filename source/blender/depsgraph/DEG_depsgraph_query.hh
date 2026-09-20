@@ -278,6 +278,12 @@ struct DEGObjectIterData {
   Object temp_dupli_object;
   bke::ObjectRuntime temp_dupli_object_runtime;
 
+  /* Whether each instance needs its world-to-object matrix and negative-scale flag. A consumer that
+   * only places geometry - Cycles does - reads neither, and inverting a 4x4 per instance is real
+   * work once Geometry Nodes turn a few hundred objects into tens of thousands. Defaults to the
+   * full behaviour so existing users are unaffected. */
+  bool need_inverse_matrix = true;
+
   /* **** Iteration over ID nodes **** */
   size_t id_node_index;
   size_t num_id_nodes;
@@ -354,7 +360,8 @@ namespace evil {
                                                        eEvaluationMode eval_mode,
                                                        bool do_matrix_setup,
                                                        Object *r_temp_object,
-                                                       bke::ObjectRuntime *r_temp_runtime);
+                                                       bke::ObjectRuntime *r_temp_runtime,
+                                                       bool need_inverse_matrix = true);
 
 /**
  * WARNING: DON'T USE!!!

@@ -115,6 +115,10 @@ void BlenderSync::sync_recalc(blender::Depsgraph &b_depsgraph,
   blender::Object *b_dicing_camera_object = get_dicing_camera_object(b_v3d, b_rv3d);
   bool dicing_camera_updated = false;
 
+  /* Filled here, consumed at the top of `sync_objects`, and cleared there as well. Its entries are
+   * only ever read on the main thread, before the walk hands anything to a worker. */
+  object_is_modified_cache.clear();
+
   /* Iterate over all blender::IDs in this depsgraph. */
   blender::DEGIDIterData deg_iter_data{};
   deg_iter_data.graph = &b_depsgraph;
@@ -178,6 +182,21 @@ void BlenderSync::sync_recalc(blender::Depsgraph &b_depsgraph,
                                    &b_ob->id :
                                    object_get_data(*b_ob, use_adaptive_subdiv);
             geometry_map.set_recalc(key);
+
+            /* Copying this geometry is about to cost a task, and on this scene the whole of what
+             * the walk waits for is one such task - 4.2 ms of it a single `corner_normals()` call
+             * that Blender recomputes because the mesh deformed. The walk discovers the dirty
+             * geometry at its very end, so the task overlaps it by a millisecond and the rest
+             * becomes the wait. Here the same geometry is already known, some ten milliseconds of
+             * walk earlier.
+             *
+             * Only an identifier is recorded, and nothing is resolved here. Resolving the mesh
+             * means `object_get_data`, which calls `BKE_mesh_wrapper_ensure_subdivision` - that one
+             * mutates the mesh, so it belongs on the main thread, and doing it here would do it on
+             * the nine frames in ten that get refused as well. The set is drained at the top of
+             * `sync_objects`, which only an accepted frame reaches; it accumulates until then
+             * because `set_recalc` above accumulates the same way. */
+            warm_normals_candidates.insert(blender::DEG_get_original(b_ob)->id.session_uid);
 
             /* Sync all contained geometry instances as well when the object changed.. */
             const map<void *, set<blender::ID *>>::const_iterator instance_geometries =
@@ -327,6 +346,12 @@ void BlenderSync::sync_data(blender::RenderData &b_render,
    * implicit check on whether it is a background render or not. What is the nicer thing here? */
   const bool background = !b_v3d;
 
+  /* `sync_data` turned out to be the largest single cost of a viewport frame - larger than the
+   * device update it feeds. These two numbers say whether that is the per-object walk and the mesh
+   * copies, or everything else put together. */
+  static const bool report_stages = getenv("CYCLES_DEBUG_VIEWPORT_PHASES") != nullptr;
+  const double stages_start_time = report_stages ? time_dt() : 0.0;
+
   sync_scene_attributes();
   sync_view_layer(b_view_layer);
   sync_integrator(b_view_layer, background, denoise_device_info);
@@ -334,10 +359,21 @@ void BlenderSync::sync_data(blender::RenderData &b_render,
   sync_shaders(b_depsgraph, b_screen, b_v3d, auto_refresh_update, frame_update);
   sync_images();
 
+  const double prelude_ms = report_stages ? (time_dt() - stages_start_time) * 1000.0 : 0.0;
+
   geometry_synced.clear(); /* use for objects and motion sync */
 
+  const double objects_start_time = report_stages ? time_dt() : 0.0;
   sync_objects_and_motion(
       b_render, b_depsgraph, b_screen, b_v3d, b_rv3d, width, height, python_thread_state);
+
+  if (report_stages) {
+    fprintf(stderr,
+            "SYNC_STAGES prelude=%.2f objects=%.2f\n",
+            prelude_ms,
+            (time_dt() - objects_start_time) * 1000.0);
+    fflush(stderr);
+  }
 
   geometry_synced.clear();
 
@@ -475,6 +511,12 @@ void BlenderSync::sync_integrator(blender::ViewLayer &b_view_layer,
   if (preview) {
     samples = get_int(cscene, "preview_samples");
     use_adaptive_sampling = RNA_boolean_get(&cscene, "use_preview_adaptive_sampling");
+    if (get_boolean(cscene, "use_preview_denoising") && get_boolean(cscene, "use_dlss_preview")) {
+      /* DLSS evaluates independent 1-spp inputs, so adaptive sampling is not applicable.
+       *
+       * Keep the saved preference untouched so it is restored when DLSS is disabled. */
+      use_adaptive_sampling = false;
+    }
     integrator->set_use_adaptive_sampling(use_adaptive_sampling);
     integrator->set_adaptive_threshold(get_float(cscene, "preview_adaptive_threshold"));
     integrator->set_adaptive_min_samples(get_int(cscene, "preview_adaptive_min_samples"));
@@ -562,7 +604,11 @@ void BlenderSync::sync_integrator(blender::ViewLayer &b_view_layer,
   }
 
   DenoiseParams denoise_params = get_denoise_params(
-      *b_scene, &b_view_layer, background, denoise_device_info);
+      *b_scene,
+      &b_view_layer,
+      background,
+      denoise_device_info,
+      (b_engine->flag & blender::RE_ENGINE_ANIMATION) != 0);
 
   /* No denoising support for vertex color baking, vertices packed into image
    * buffer have no relation to neighbors. */
@@ -583,7 +629,24 @@ void BlenderSync::sync_integrator(blender::ViewLayer &b_view_layer,
     integrator->set_denoiser_prefilter(denoise_params.prefilter);
     integrator->set_denoiser_quality(denoise_params.quality);
     integrator->set_denoiser_upscale_factor(denoise_params.upscale_factor);
+    integrator->set_dlss_offline(denoise_params.dlss_offline);
+    integrator->set_dlss_animation(denoise_params.dlss_animation);
+    integrator->set_dlss_reset_history(denoise_params.dlss_reset_history);
+    integrator->set_dlss_zero_motion_first(denoise_params.dlss_zero_motion_first);
+    integrator->set_dlss_iterations(denoise_params.dlss_iterations);
+    integrator->set_dlss_preset(denoise_params.dlss_preset);
   }
+
+  /* The volume grid stands in for what the path tracer does with the medium, and only in the
+   * viewport: a final render has the samples to trace the medium honestly, and would only lose
+   * accuracy by reading an approximation instead. */
+  integrator->set_use_approximate_volumes(!background &&
+                                          get_boolean(cscene, "use_approximate_volumes"));
+  integrator->set_approximate_volumes_always(get_enum(cscene, "approximate_volumes_mode", 2, 0) ==
+                                             1);
+  integrator->set_approximate_volumes_distance(get_float(cscene, "approximate_volumes_distance"));
+  integrator->set_approximate_volumes_light_samples(
+      get_int(cscene, "approximate_volumes_light_samples"));
 
   /* UPDATE_NONE as we don't want to tag the integrator as modified (this was done by the
    * set calls above), but we need to make sure that the dependent things are tagged. */
@@ -788,6 +851,7 @@ static bool get_known_pass_type(blender::RenderPass &b_pass, PassType &type, Pas
   MAP_PASS("Denoising Roughness", PASS_DENOISING_ROUGHNESS, true);
   MAP_PASS("Denoising Depth", PASS_DENOISING_DEPTH, true);
   MAP_PASS("Denoising Backward Motion", PASS_DENOISING_BACKWARD_MOTION, true);
+  MAP_PASS("Denoising Specular Motion", PASS_DENOISING_SPECULAR_MOTION, true);
 
   MAP_PASS("Shadow Catcher", PASS_SHADOW_CATCHER, false);
   MAP_PASS("Noisy Shadow Catcher", PASS_SHADOW_CATCHER, true);
@@ -1088,6 +1152,12 @@ SessionParams BlenderSync::get_session_params(blender::RenderEngine &b_engine,
     params.use_sample_subset = false;
     params.sample_subset_offset = 0;
     params.sample_subset_length = 0;
+
+    /* Reduced sample budget for the time the user is navigating, transforming or playing back.
+     * Honoured only by the viewport DLSS path in the render scheduler. */
+    if (get_boolean(cscene, "use_dlss_interactive_samples")) {
+      params.interactive_samples = get_int(cscene, "dlss_interactive_samples");
+    }
   }
 
   /* Viewport Performance */
@@ -1137,6 +1207,11 @@ SessionParams BlenderSync::get_session_params(blender::RenderEngine &b_engine,
   }
   else {
     params.use_auto_tile = false;
+
+    if (get_boolean(cscene, "use_preview_denoising") && get_boolean(cscene, "use_dlss_preview")) {
+      /* Disable resolution divider with DLSS */
+      params.use_resolution_divider = false;
+    }
   }
 
   return params;
@@ -1145,7 +1220,8 @@ SessionParams BlenderSync::get_session_params(blender::RenderEngine &b_engine,
 DenoiseParams BlenderSync::get_denoise_params(blender::Scene &b_scene,
                                               blender::ViewLayer *b_view_layer,
                                               bool background,
-                                              const DeviceInfo &denoise_device_info)
+                                              const DeviceInfo &denoise_device_info,
+                                              const bool is_animation)
 {
   enum DenoiserInput {
     DENOISER_INPUT_RGB = 1,
@@ -1153,6 +1229,16 @@ DenoiseParams BlenderSync::get_denoise_params(blender::Scene &b_scene,
     DENOISER_INPUT_RGB_ALBEDO_NORMAL = 3,
 
     DENOISER_INPUT_NUM,
+  };
+
+  enum DenoiserDLSSQuality {
+    DENOISER_DLSS_MODE_DLAA = 0,
+    DENOISER_DLSS_MODE_QUALITY = 1,
+    DENOISER_DLSS_MODE_BALANCED = 2,
+    DENOISER_DLSS_MODE_PERF = 3,
+    DENOISER_DLSS_MODE_ULTRA_PERF = 4,
+
+    DENOISER_DLSS_MODE_NUM,
   };
 
   DenoiseParams denoising;
@@ -1181,6 +1267,35 @@ DenoiseParams BlenderSync::get_denoise_params(blender::Scene &b_scene,
       if (!get_boolean(clayer, "use_denoising")) {
         denoising.use = false;
       }
+
+      const bool has_cryptomatte =
+          RNA_boolean_get(&view_layer_rna_ptr, "use_pass_cryptomatte_object") ||
+          RNA_boolean_get(&view_layer_rna_ptr, "use_pass_cryptomatte_material") ||
+          RNA_boolean_get(&view_layer_rna_ptr, "use_pass_cryptomatte_asset");
+      if (denoising.use && get_boolean(cscene, "use_dlss_render")) {
+        if (has_cryptomatte) {
+          denoising.type = DENOISER_OPTIX;
+          LOG_WARNING << "DLSS final render disabled: Cryptomatte requires full-resolution "
+                         "unfiltered data. Falling back to OptiX.";
+        }
+        else if (!Denoiser::is_device_supported(DENOISER_DLSS, denoise_device_info)) {
+          denoising.type = DENOISER_OPTIX;
+          LOG_WARNING << "DLSS final render unavailable on the selected device/driver. "
+                         "Falling back to OptiX.";
+        }
+        else {
+          denoising.type = DENOISER_DLSS;
+          denoising.use_gpu = true;
+          denoising.start_sample = 0;
+          denoising.dlss_offline = true;
+          denoising.dlss_animation = is_animation;
+          denoising.dlss_reset_history = true;
+          denoising.dlss_zero_motion_first = true;
+          denoising.dlss_iterations = denoising.dlss_animation ?
+                                          get_int(cscene, "dlss_animation_iterations") :
+                                          get_int(cscene, "dlss_still_iterations");
+        }
+      }
     }
   }
   else {
@@ -1198,13 +1313,73 @@ DenoiseParams BlenderSync::get_denoise_params(blender::Scene &b_scene,
     input_passes = (DenoiserInput)get_enum(
         cscene, "preview_denoising_input_passes", DENOISER_INPUT_NUM, DENOISER_INPUT_RGB_ALBEDO);
 
+    if (get_boolean(cscene, "use_dlss_preview")) {
+      denoising.type = DENOISER_DLSS;
+    }
     /* Auto select fastest denoiser. */
-    if (denoising.type == DENOISER_NONE) {
+    else if (denoising.type == DENOISER_NONE) {
       denoising.type = Denoiser::automatic_viewport_denoiser_type(denoise_device_info);
       if (denoising.type == DENOISER_NONE) {
         denoising.use = false;
       }
     }
+  }
+
+  if (denoising.type == DENOISER_DLSS) {
+    /* Keep the configured OptiX denoiser as the compatibility fallback. */
+    if (!Denoiser::is_device_supported(denoising.type, denoise_device_info)) {
+      denoising.type = DENOISER_OPTIX;
+      denoising.use_gpu = true;
+      denoising.upscale_factor = 1.0f;
+      if (!Denoiser::is_device_supported(denoising.type, denoise_device_info)) {
+        denoising.use = false;
+      }
+      return denoising;
+    }
+
+    denoising.start_sample = 0;
+
+    /* The model to ask NGX for. Only a request: a driver profile can override it, and the
+     * preferences show which model was actually used so the two can be told apart. */
+    /* An enumeration, so read as one: `get_int` on an enumerated property does not return the
+     * value, and the model chosen in the interface never reached the library. Its values are the
+     * SDK's own - 0, 4, 5, 6 - and not consecutive, so no range check applies. */
+    denoising.dlss_preset = get_enum(cscene, "dlss_preset");
+
+    const char *quality_property = background ? "dlss_render_mode" : "dlss_preview_mode";
+    switch ((DenoiserDLSSQuality)get_enum(cscene,
+                                          quality_property,
+                                          DENOISER_DLSS_MODE_NUM,
+                                          background ? DENOISER_DLSS_MODE_QUALITY :
+                                                       DENOISER_DLSS_MODE_BALANCED))
+    {
+      case DENOISER_DLSS_MODE_DLAA:
+        denoising.quality = DENOISER_QUALITY_HIGH;
+        denoising.upscale_factor = 1.0f;
+        break;
+      case DENOISER_DLSS_MODE_QUALITY:
+        denoising.quality = DENOISER_QUALITY_HIGH;
+        denoising.upscale_factor = 1.0f / 0.66666667f;
+        break;
+      default:
+      case DENOISER_DLSS_MODE_BALANCED:
+        denoising.quality = DENOISER_QUALITY_BALANCED;
+        denoising.upscale_factor = 1.0f / 0.58f;
+        break;
+      case DENOISER_DLSS_MODE_PERF:
+        denoising.quality = DENOISER_QUALITY_FAST;
+        denoising.upscale_factor = 2.0f;
+        break;
+      case DENOISER_DLSS_MODE_ULTRA_PERF:
+        denoising.quality = DENOISER_QUALITY_FAST;
+        denoising.upscale_factor = 3.0f;
+        break;
+    }
+
+    denoising.passes = DENOISER_PASS_ALBEDO | DENOISER_PASS_SPECULAR_ALBEDO |
+                       DENOISER_PASS_NORMAL | DENOISER_PASS_ROUGHNESS | DENOISER_PASS_DEPTH |
+                       DENOISER_PASS_MOTION | DENOISER_PASS_SPECULAR_MOTION;
+    return denoising;
   }
 
   switch (input_passes) {

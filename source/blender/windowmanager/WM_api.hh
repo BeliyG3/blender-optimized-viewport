@@ -382,6 +382,8 @@ void WM_window_set_active_layout(wmWindow *win, WorkSpace *workspace, WorkSpaceL
  * Get the active screen of the active workspace in \a win.
  */
 bScreen *WM_window_get_active_screen(const wmWindow *win) ATTR_NONNULL() ATTR_WARN_UNUSED_RESULT;
+/** Apply the VSync preference to every window's GPU context. */
+void WM_windows_vsync_update(wmWindowManager *wm);
 void WM_window_set_active_screen(wmWindow *win, WorkSpace *workspace, bScreen *screen)
     ATTR_NONNULL(1);
 

@@ -13,6 +13,7 @@
 #include "session/buffers.h"
 
 #include "util/log.h"
+#include "util/time.h"
 #include "util/string.h"
 
 #include "kernel/device/gpu/block_sizes.h"
@@ -310,23 +311,57 @@ void PathTraceWorkGPU::alloc_work_memory()
   alloc_integrator_queue();
   alloc_integrator_sorting();
   alloc_integrator_path_split();
+
+  /* Every allocation above may have rewritten pointers in `integrator_state_gpu_`, so the device
+   * side copy has to be refreshed on the next `init_execution()`. */
+  integrator_state_gpu_dirty_ = true;
 }
 
 void PathTraceWorkGPU::init_execution()
 {
-  queue_->init_execution();
+  /* Copy to device side struct in constant memory.
+   *
+   * Only when it actually changed: the pointers in it are rewritten by `alloc_work_memory()` and
+   * by a kernel module reload, never between render works. Issued before the queue's barrier,
+   * which is what makes this legacy-stream copy visible to the non-blocking work stream. */
+  if (integrator_state_gpu_dirty_) {
+    device_->const_copy_to(
+        "integrator_state", &integrator_state_gpu_, sizeof(integrator_state_gpu_));
+    integrator_state_gpu_dirty_ = false;
+  }
 
-  /* Copy to device side struct in constant memory. */
-  device_->const_copy_to(
-      "integrator_state", &integrator_state_gpu_, sizeof(integrator_state_gpu_));
+  queue_->init_execution();
+}
+
+/* Diagnostics for the wavefront host round trips, behind CYCLES_DEBUG_WAVEFRONT_STALLS.
+ *
+ * Every wavefront stage ends with a device-to-host copy of the queue counters plus a stream
+ * synchronize, because the host picks the next kernel from those counts. The number of stages
+ * follows path depth, not pixel count, which is the one cost structure consistent with a viewport
+ * frame not getting cheaper when the DLSS input resolution drops. These counters say how much of a
+ * sample actually sits in those stalls, so the question stops being a guess. */
+static bool wavefront_stall_stats_enabled()
+{
+  static const bool enabled = getenv("CYCLES_DEBUG_WAVEFRONT_STALLS") != nullptr;
+  return enabled;
 }
 
 bool PathTraceWorkGPU::update_queue_counter_and_cache()
 {
+  const bool measure = wavefront_stall_stats_enabled();
+  const double stall_start = measure ? time_dt() : 0.0;
+
   /* Copy stats from the device. */
   queue_->copy_from_device(integrator_queue_counter_);
 
-  if (!queue_->synchronize()) {
+  const bool synchronized = queue_->synchronize();
+
+  if (measure) {
+    wavefront_round_trips_ += 1;
+    wavefront_stall_seconds_ += time_dt() - stall_start;
+  }
+
+  if (!synchronized) {
     return false;
   }
 
@@ -363,6 +398,12 @@ void PathTraceWorkGPU::render_samples(RenderStatistics &statistics,
                              sample_offset,
                              device_scene_->data.integrator.scrambling_distance);
 
+  const double sample_start_time = wavefront_stall_stats_enabled() ? time_dt() : 0.0;
+  if (wavefront_stall_stats_enabled()) {
+    wavefront_round_trips_ = 0;
+    wavefront_stall_seconds_ = 0.0;
+  }
+
   enqueue_reset();
 
   int num_iterations = 0;
@@ -371,8 +412,11 @@ void PathTraceWorkGPU::render_samples(RenderStatistics &statistics,
   /* TODO: set a hard limit in case of undetected kernel failures? */
   while (true) {
     /* Enqueue work from the scheduler, on start or when there are not enough
-     * paths to keep the device occupied. */
-    bool finished;
+     * paths to keep the device occupied.
+     *
+     * NOTE: initialized here because `enqueue_work_tiles()` has an early return that leaves it
+     * untouched, and it is read below. */
+    bool finished = false;
     if (enqueue_work_tiles(finished)) {
       if (!update_queue_counter_and_cache()) {
         break; /* Stop on error. */
@@ -408,6 +452,20 @@ void PathTraceWorkGPU::render_samples(RenderStatistics &statistics,
   }
   else {
     statistics.occupancy = 0.0f;
+  }
+
+  if (wavefront_stall_stats_enabled()) {
+    const double total = time_dt() - sample_start_time;
+    const double stalls = wavefront_stall_seconds_;
+    fprintf(stderr,
+            "WAVEFRONT_STALLS iterations=%d round_trips=%d stall_ms=%.2f total_ms=%.2f "
+            "stall_share=%.1f\n",
+            num_iterations,
+            wavefront_round_trips_,
+            stalls * 1000.0,
+            total * 1000.0,
+            total > 0.0 ? stalls / total * 100.0 : 0.0);
+    fflush(stderr);
   }
 }
 
@@ -1094,7 +1152,79 @@ bool PathTraceWorkGPU::copy_to_display_interop(PathTraceDisplay *display,
 
   device_graphics_interop_->unmap();
 
+  /* Frame Generation consumes the noisy guide passes independently from the denoised display
+   *
+   * color. A failure here disables only the generated frame for this update. */
+  copy_frame_generation_guides_interop(display, num_samples);
+
   return true;
+}
+
+bool PathTraceWorkGPU::copy_frame_generation_guides_interop(PathTraceDisplay *display,
+                                                            const int num_samples)
+{
+  const BufferParams &buffer_params = effective_buffer_params_;
+  const int width = buffer_params.window_width;
+  const int height = buffer_params.window_height;
+  if (!display->frame_generation_interop_begin(width, height)) {
+    return false;
+  }
+
+  bool success = true;
+  const auto copy_pass = [&](const DisplayDriver::FrameGenerationBuffer guide_buffer,
+                             const PassType pass_type,
+                             const int pass_offset,
+                             const int num_components) {
+    if (!success || pass_offset == PASS_UNUSED) {
+      success = false;
+      return;
+    }
+
+    GraphicsInteropBuffer &interop_buffer = display->frame_generation_interop_get_buffer(
+        guide_buffer);
+    unique_ptr<DeviceGraphicsInterop> &device_interop =
+        (guide_buffer == DisplayDriver::FrameGenerationBuffer::DEPTH) ?
+            device_frame_generation_depth_interop_ :
+            device_frame_generation_motion_interop_;
+    if (!device_interop) {
+      device_interop = queue_->graphics_interop_create();
+    }
+    device_interop->set_buffer(interop_buffer);
+    const device_ptr destination_pointer = device_interop->map();
+    if (!destination_pointer) {
+      success = false;
+      return;
+    }
+
+    PassAccessor::PassAccessInfo access_info;
+    access_info.type = pass_type;
+    access_info.mode = PassMode::NOISY;
+    access_info.offset = pass_offset;
+    access_info.use_sample_count = true;
+
+    PassAccessor::Destination destination(pass_type, PassMode::NOISY);
+    destination.d_pixels = destination_pointer;
+    destination.num_components = num_components;
+    destination.pixel_stride = num_components;
+    destination.stride = width * num_components;
+
+    const KernelFilm &kfilm = device_scene_->data.film;
+    const PassAccessorGPU accessor(queue_.get(), access_info, kfilm.exposure, num_samples);
+    success = accessor.get_render_tile_pixels(buffers_.get(), buffer_params, destination);
+    device_interop->unmap();
+  };
+
+  copy_pass(DisplayDriver::FrameGenerationBuffer::DEPTH,
+            PASS_DEPTH,
+            buffer_params.get_pass_offset(PASS_DENOISING_DEPTH),
+            1);
+  copy_pass(DisplayDriver::FrameGenerationBuffer::MOTION,
+            PASS_MOTION,
+            buffer_params.get_pass_offset(PASS_MOTION),
+            4);
+
+  display->frame_generation_interop_end(success);
+  return success;
 }
 
 void PathTraceWorkGPU::destroy_gpu_resources(PathTraceDisplay *display)
@@ -1104,6 +1234,8 @@ void PathTraceWorkGPU::destroy_gpu_resources(PathTraceDisplay *display)
   }
   display->graphics_interop_activate();
   device_graphics_interop_ = nullptr;
+  device_frame_generation_depth_interop_ = nullptr;
+  device_frame_generation_motion_interop_ = nullptr;
   display->graphics_interop_deactivate();
 }
 
@@ -1245,6 +1377,23 @@ void PathTraceWorkGPU::denoise_volume_guiding_buffers()
   }
 }
 
+void PathTraceWorkGPU::build_volume_froxel_grid()
+{
+  const KernelVolumeFroxel &froxel = device_scene_->data.froxel;
+  const int num_columns = froxel.res_x * froxel.res_y;
+  if (num_columns <= 0) {
+    return;
+  }
+
+  const DeviceKernelArguments args(&num_columns);
+
+  /* What the medium is in every cell of every column. Reading it is a march along the slices,
+   * which is why there is no second pass integrating it: a prefix would turn a segment into two
+   * lookups and a division by the transmittance at its near end, and that transmittance is what
+   * goes to zero inside a dense medium. */
+  queue_->enqueue(DEVICE_KERNEL_VOLUME_FROXEL_INJECT, num_columns, args);
+}
+
 bool PathTraceWorkGPU::copy_render_buffers_from_device()
 {
   /* May not exist if cancelled before rendering started. */
@@ -1271,7 +1420,31 @@ bool PathTraceWorkGPU::copy_render_buffers_to_device()
 
 bool PathTraceWorkGPU::zero_render_buffers()
 {
-  queue_->zero_to_device(buffers_->buffer);
+  /* The path tracer only ever writes to the leading `width * height` pixels of the allocation:
+   * `film_pass_pixel_render_buffer()` indexes it as `offset + x + y * stride`, and both come from
+   * the effective, input-resolution parameters, where `update_offset_stride()` makes the first
+   * traced pixel land on index 0.
+   *
+   * With an upscaling denoiser the buffer is allocated at the larger output resolution, so zeroing
+   * the whole thing every iteration is wasted bandwidth. The output-resolution remainder only
+   * holds the denoised pass, which the denoiser rewrites in full on every evaluation. */
+  const size_t allocated_size = buffers_->buffer.memory_size();
+  const size_t traced_size = size_t(effective_buffer_params_.width) *
+                             size_t(effective_buffer_params_.height) *
+                             size_t(effective_buffer_params_.pass_stride) * sizeof(float);
+
+  const bool can_zero_prefix = traced_size != 0 && traced_size < allocated_size &&
+                               effective_buffer_params_.pass_stride ==
+                                   buffers_->params.pass_stride &&
+                               effective_buffer_params_.width <= buffers_->params.width &&
+                               effective_buffer_params_.height <= buffers_->params.height;
+
+  if (can_zero_prefix) {
+    queue_->zero_to_device_prefix(buffers_->buffer, traced_size);
+  }
+  else {
+    queue_->zero_to_device(buffers_->buffer);
+  }
 
   return true;
 }

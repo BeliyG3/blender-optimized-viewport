@@ -190,23 +190,34 @@ class GHOST_ContextVK : public GHOST_Context {
 #endif
 
   /**
-   * Sets the swap interval for `swapBuffers`.
-   * \param interval: The swap interval to use.
+   * Sets the VSync mode for `swapBuffers`, as a #GHOST_TVSyncModes value.
+   *
+   * There is no swap interval on Vulkan; what there is, is the present mode, chosen when the
+   * swapchain is created. So the value is kept and the swapchain is recreated on the next
+   * acquire - the same path a resize or an HDR toggle takes, hence no restart.
+   * \param interval: The #GHOST_TVSyncModes value to use.
    * \return A boolean success indicator.
    */
-  GHOST_TSuccess setSwapInterval(int /*interval*/) override
+  GHOST_TSuccess setSwapInterval(int interval) override
   {
-    return GHOST_kFailure;
+    const GHOST_TVSyncModes vsync = GHOST_TVSyncModes(interval);
+    if (vsync == context_params_.vsync) {
+      return GHOST_kSuccess;
+    }
+    context_params_.vsync = vsync;
+    swapchain_recreate_requested_ = true;
+    return GHOST_kSuccess;
   }
 
   /**
-   * Gets the current swap interval for swapBuffers.
-   * \param interval_out: Variable to store the swap interval if it can be read.
-   * \return Whether the swap interval can be read.
+   * Gets the current VSync mode for `swapBuffers`, as a #GHOST_TVSyncModes value.
+   * \param interval_out: Variable to store the mode.
+   * \return Whether the mode can be read.
    */
-  GHOST_TSuccess getSwapInterval(int & /*interval_out*/) override
+  GHOST_TSuccess getSwapInterval(int &interval_out) override
   {
-    return GHOST_kFailure;
+    interval_out = int(context_params_.vsync);
+    return GHOST_kSuccess;
   };
 
   /**
@@ -272,6 +283,12 @@ class GHOST_ContextVK : public GHOST_Context {
   VkExtent2D render_extent_min_;
   VkSurfaceFormatKHR surface_format_;
   bool use_hdr_swapchain_;
+  /* The present mode changed through `setSwapInterval`; recreate the swapchain on the next
+   * acquire, the way an HDR toggle does. */
+  bool swapchain_recreate_requested_ = false;
+
+  /* The present mode of the swapchain in use, to tell a change of mode from a resize. */
+  VkPresentModeKHR present_mode_ = VK_PRESENT_MODE_FIFO_KHR;
 
   std::optional<uint32_t> acquired_swapchain_image_index_;
 

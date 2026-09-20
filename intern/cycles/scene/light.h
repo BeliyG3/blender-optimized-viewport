@@ -212,7 +212,13 @@ class LightManager {
   void remove_ies(const int slot);
 
   void device_update(Device *device, DeviceScene *dscene, Scene *scene, Progress &progress);
-  void device_free(Device *device, DeviceScene *dscene, const bool free_background = true);
+  /* `release_device_memory` is what separates tearing the scene down from refreshing it: on the
+   * update path every buffer here is refilled immediately, and releasing the device allocation
+   * only to allocate it again costs a GPU stall per buffer. */
+  void device_free(Device *device,
+                   DeviceScene *dscene,
+                   const bool free_background = true,
+                   const bool release_device_memory = true);
 
   void tag_update(Scene *scene, const uint32_t flag);
 

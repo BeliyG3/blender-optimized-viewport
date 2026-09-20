@@ -19,7 +19,7 @@ struct SceneLock {
   CCL_NS::Scene *scene;
 
  private:
-  CCL_NS::thread_scoped_lock sceneLock;
+  CCL_NS::thread_scoped_timed_lock sceneLock;
 };
 
 class HdCyclesSession final : public PXR_NS::HdRenderParam {

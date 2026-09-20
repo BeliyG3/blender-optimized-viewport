@@ -2,23 +2,47 @@
  *
  * SPDX-License-Identifier: Apache-2.0 */
 
+#include "GPU_compute.hh"
 #include "GPU_context.hh"
+#include "GPU_frame_generation.hh"
 #include "GPU_immediate.hh"
 #include "GPU_platform.hh"
 #include "GPU_platform_backend_enum.h"
 #include "GPU_shader.hh"
 #include "GPU_state.hh"
+#include "GPU_dlss_ray_reconstruction.hh"
 #include "GPU_texture.hh"
+#include "GPU_viewport.hh"
+
+#include "DNA_view3d_types.h"
 
 #include "RE_engine.h"
 
 #include "blender/display_driver.h"
 
+#include "integrator/frame_generation_scheduler.h"
+
 #include "util/log.h"
 #include "util/math.h"
+#include "util/time.h"
 #include "util/vector.h"
 
 CCL_NAMESPACE_BEGIN
+
+/* Written by the main thread when a sync is accepted, read by the render thread when it delivers
+ * pixels. Relaxed on purpose: it labels a diagnostic sample, and being one frame stale in a label
+ * costs nothing, whereas ordering it would put a barrier on the delivery path. */
+static std::atomic<int> g_accepted_scene_frame{-1};
+
+void note_accepted_scene_frame(const int frame)
+{
+  g_accepted_scene_frame.store(frame, std::memory_order_relaxed);
+}
+
+int accepted_scene_frame()
+{
+  return g_accepted_scene_frame.load(std::memory_order_relaxed);
+}
 
 /* --------------------------------------------------------------------
  * BlenderDisplayShader.
@@ -108,7 +132,10 @@ class DisplayGPUTexture {
   DisplayGPUTexture &operator=(DisplayGPUTexture &other) = delete;
 
   DisplayGPUTexture(DisplayGPUTexture &&other) noexcept
-      : gpu_texture(other.gpu_texture), width(other.width), height(other.height)
+      : gpu_texture(other.gpu_texture),
+        width(other.width),
+        height(other.height),
+        format(other.format)
   {
     other.reset();
   }
@@ -122,15 +149,19 @@ class DisplayGPUTexture {
     gpu_texture = other.gpu_texture;
     width = other.width;
     height = other.height;
+    format = other.format;
 
     other.reset();
 
     return *this;
   }
 
-  bool gpu_resources_ensure(const uint texture_width, const uint texture_height)
+  bool gpu_resources_ensure(const uint texture_width,
+                            const uint texture_height,
+                            const blender::gpu::TextureFormat texture_format =
+                                blender::gpu::TextureFormat::SFLOAT_16_16_16_16)
   {
-    if (width != texture_width || height != texture_height) {
+    if (width != texture_width || height != texture_height || format != texture_format) {
       gpu_resources_destroy();
     }
 
@@ -140,13 +171,14 @@ class DisplayGPUTexture {
 
     width = texture_width;
     height = texture_height;
+    format = texture_format;
 
     /* Texture must have a minimum size of 1x1. */
     gpu_texture = blender::GPU_texture_create_2d("CyclesBlitTexture",
                                                  max(width, 1),
                                                  max(height, 1),
                                                  1,
-                                                 blender::gpu::TextureFormat::SFLOAT_16_16_16_16,
+                                                 format,
                                                  blender::GPU_TEXTURE_USAGE_GENERAL,
                                                  nullptr);
 
@@ -184,6 +216,7 @@ class DisplayGPUTexture {
   /* Dimensions of the texture in pixels. */
   int width = 0;
   int height = 0;
+  blender::gpu::TextureFormat format = blender::gpu::TextureFormat::Invalid;
 
  protected:
   void reset()
@@ -191,6 +224,7 @@ class DisplayGPUTexture {
     gpu_texture = nullptr;
     width = 0;
     height = 0;
+    format = blender::gpu::TextureFormat::Invalid;
   }
 };
 
@@ -211,7 +245,10 @@ class DisplayGPUPixelBuffer {
   DisplayGPUPixelBuffer &operator=(DisplayGPUPixelBuffer &other) = delete;
 
   DisplayGPUPixelBuffer(DisplayGPUPixelBuffer &&other) noexcept
-      : gpu_pixel_buffer(other.gpu_pixel_buffer), width(other.width), height(other.height)
+      : gpu_pixel_buffer(other.gpu_pixel_buffer),
+        width(other.width),
+        height(other.height),
+        bytes_per_pixel(other.bytes_per_pixel)
   {
     other.reset();
   }
@@ -225,21 +262,25 @@ class DisplayGPUPixelBuffer {
     gpu_pixel_buffer = other.gpu_pixel_buffer;
     width = other.width;
     height = other.height;
+    bytes_per_pixel = other.bytes_per_pixel;
 
     other.reset();
 
     return *this;
   }
 
-  bool gpu_resources_ensure(const uint new_width, const uint new_height, bool &buffer_recreated)
+  bool gpu_resources_ensure(const uint new_width,
+                            const uint new_height,
+                            bool &buffer_recreated,
+                            const size_t new_bytes_per_pixel = sizeof(half4))
   {
     buffer_recreated = false;
 
-    const size_t required_size = sizeof(half4) * new_width * new_height;
+    const size_t required_size = new_bytes_per_pixel * new_width * new_height;
 
     /* Try to re-use the existing PBO if it has usable size. */
     if (gpu_pixel_buffer) {
-      if (new_width != width || new_height != height ||
+      if (new_width != width || new_height != height || new_bytes_per_pixel != bytes_per_pixel ||
           blender::GPU_pixel_buffer_size(gpu_pixel_buffer) < required_size)
       {
         buffer_recreated = true;
@@ -250,6 +291,7 @@ class DisplayGPUPixelBuffer {
     /* Update size. */
     width = new_width;
     height = new_height;
+    bytes_per_pixel = new_bytes_per_pixel;
 
     /* Create pixel buffer if not already created. */
     if (!gpu_pixel_buffer) {
@@ -289,6 +331,7 @@ class DisplayGPUPixelBuffer {
   /* Dimensions of the PBO. */
   int width = 0;
   int height = 0;
+  size_t bytes_per_pixel = 0;
 
  protected:
   void reset()
@@ -296,6 +339,7 @@ class DisplayGPUPixelBuffer {
     gpu_pixel_buffer = nullptr;
     width = 0;
     height = 0;
+    bytes_per_pixel = 0;
   }
 };
 
@@ -364,6 +408,57 @@ struct BlenderDisplayDriver::Tiles {
   } finished_tiles;
 };
 
+struct BlenderDisplayDriver::DlssDenoiserState {
+  /* Null until the first frame that asks for it, and null for good on a backend that cannot run
+   * the model - which is every backend but Vulkan. */
+  std::unique_ptr<blender::gpu::DlssRayReconstructionSession> session;
+  bool unavailable = false;
+
+};
+
+struct BlenderDisplayDriver::FrameGenerationState {
+  bool enabled = false;
+  bool guides_active = false;
+  bool guides_ready = false;
+  bool permanently_failed = false;
+  uint64_t frame_id = 0;
+  int guide_width = 0;
+  int guide_height = 0;
+
+  DisplayGPUPixelBuffer linear_depth_buffer;
+  DisplayGPUPixelBuffer motion_buffer;
+  DisplayGPUTexture linear_depth_texture;
+  DisplayGPUTexture motion_texture;
+  DisplayGPUTexture hardware_depth_texture;
+  DisplayGPUTexture screen_motion_texture;
+
+  blender::gpu::FrameGenerationCamera camera;
+  BlenderDisplayDriver::Params last_evaluated_params;
+  BlenderDisplayDriver::Params pending_params;
+  ViewportFrameGenerationScheduler scheduler;
+  ViewportFrameGenerationScheduler::Decision pending_decision;
+  uint64_t pending_revision = 0;
+  bool pending_valid = false;
+  bool retained_frame_available = false;
+  blender::gpu::Shader *preprocess_shader = nullptr;
+
+  void gpu_resources_destroy()
+  {
+    pending_valid = false;
+    retained_frame_available = false;
+    if (preprocess_shader != nullptr) {
+      blender::GPU_shader_free(preprocess_shader);
+      preprocess_shader = nullptr;
+    }
+    linear_depth_buffer.gpu_resources_destroy();
+    motion_buffer.gpu_resources_destroy();
+    linear_depth_texture.gpu_resources_destroy();
+    motion_texture.gpu_resources_destroy();
+    hardware_depth_texture.gpu_resources_destroy();
+    screen_motion_texture.gpu_resources_destroy();
+  }
+};
+
 BlenderDisplayDriver::BlenderDisplayDriver(blender::RenderEngine &b_engine,
                                            blender::Scene &b_scene,
                                            blender::RegionView3D *b_rv3d,
@@ -372,7 +467,9 @@ BlenderDisplayDriver::BlenderDisplayDriver(blender::RenderEngine &b_engine,
       b_rv3d_(b_rv3d),
       background_(background),
       display_shader_(BlenderDisplayShader::create(b_engine, b_scene)),
-      tiles_(make_unique<Tiles>())
+      tiles_(make_unique<Tiles>()),
+      frame_generation_(make_unique<FrameGenerationState>()),
+      dlss_denoiser_(make_unique<DlssDenoiserState>())
 {
   /* Create context while on the main thread. */
   gpu_context_create();
@@ -490,8 +587,59 @@ static void update_tile_texture_pixels(const DrawTileAndPBO &tile)
                                                     0);
 }
 
+double BlenderDisplayDriver::get_delivered_fps() const
+{
+  return delivered_fps_.load(std::memory_order_relaxed);
+}
+
 void BlenderDisplayDriver::update_end()
 {
+  /* Time between deliveries of new pixels to the viewport. Smoothed, because a single interval is
+   * dominated by whichever work happened to finish; the exponential factor keeps roughly the last
+   * second visible. A gap longer than a second means rendering had stopped, so restart rather than
+   * average across the pause. */
+  {
+    const double now = time_dt();
+    if (last_delivery_time_ != 0.0) {
+      const double delta = now - last_delivery_time_;
+      if (delta > 0.0 && delta < 1.0) {
+        const double instant_fps = 1.0 / delta;
+        const double previous = delivered_fps_.load(std::memory_order_relaxed);
+        const double smoothed = (previous > 0.0) ? previous * 0.8 + instant_fps * 0.2 : instant_fps;
+        delivered_fps_.store(smoothed, std::memory_order_relaxed);
+      }
+      else if (delta >= 1.0) {
+        delivered_fps_.store(0.0, std::memory_order_relaxed);
+      }
+
+      /* The same interval, kept rather than smoothed away. Averaging answers "how fast"; the owner
+       * is asking "how evenly", and those are different questions - 18 fps with even spacing and 18
+       * fps alternating 30/80 ms look nothing alike. Paired with the scene frame that was last
+       * accepted, because the eye judges the step in the animation, not the wall clock: a sequence
+       * of deliveries reading 1,1,2,1,2 scene frames apart is jerky however even the milliseconds
+       * are. Printed in batches so the series survives; nothing is allocated here. */
+      if (report_deliveries_) {
+        delivery_ms_[delivery_count_ % std::size(delivery_ms_)] = delta * 1000.0;
+        delivery_cfra_[delivery_count_ % std::size(delivery_cfra_)] = accepted_scene_frame();
+        delivery_count_++;
+
+        if (delivery_count_ % std::size(delivery_ms_) == 0) {
+          fprintf(stderr, "DELIVERY n=%d dt=", int(std::size(delivery_ms_)));
+          for (const double sample : delivery_ms_) {
+            fprintf(stderr, "%.1f,", sample);
+          }
+          fprintf(stderr, " cfra=");
+          for (const int frame : delivery_cfra_) {
+            fprintf(stderr, "%d,", frame);
+          }
+          fprintf(stderr, "\n");
+          fflush(stderr);
+        }
+      }
+    }
+    last_delivery_time_ = now;
+  }
+
   /* Unpack the PBO into the texture as soon as the new content is provided.
    *
    * This allows to ensure that the unpacking happens while resources like graphics interop (which
@@ -516,6 +664,64 @@ void BlenderDisplayDriver::update_end()
   }
   else {
     update_tile_texture_pixels(tiles_->current_tile);
+  }
+
+  FrameGenerationState &frame_generation = *frame_generation_;
+  const DrawTile &current_tile = tiles_->current_tile.tile;
+  if (frame_generation.enabled && current_tile.ready_to_draw()) {
+    frame_generation.retained_frame_available = true;
+  }
+  if (frame_generation.enabled && frame_generation.guides_ready &&
+      !frame_generation.permanently_failed && current_tile.ready_to_draw())
+  {
+    const uint64_t revision = current_tile.params.render_revision;
+    const bool mapping_changed =
+        frame_generation.scheduler.has_evaluated_revision() &&
+        (current_tile.params.full_size != frame_generation.last_evaluated_params.full_size ||
+         current_tile.params.full_offset != frame_generation.last_evaluated_params.full_offset ||
+         current_tile.params.size != frame_generation.last_evaluated_params.size);
+    if (mapping_changed) {
+      request_frame_generation_reset();
+    }
+
+    const ViewportFrameGenerationScheduler::Decision decision =
+        frame_generation.scheduler.begin_real_frame(revision);
+    if (decision.evaluate) {
+      if (frame_generation.preprocess_shader == nullptr) {
+        frame_generation.preprocess_shader = blender::GPU_shader_create_from_info_name(
+            "vk_frame_generation_preprocess");
+      }
+
+      if (frame_generation.preprocess_shader == nullptr) {
+        frame_generation.permanently_failed = true;
+        LOG_WARNING << "DLSS Frame Generation unavailable; continuing with real viewport frames";
+      }
+      else {
+        blender::gpu::Shader *shader = frame_generation.preprocess_shader;
+        blender::GPU_shader_bind(shader);
+        blender::GPU_shader_uniform_1f(shader, "near_clip", frame_generation.camera.near_clip);
+        blender::GPU_shader_uniform_1f(shader, "far_clip", frame_generation.camera.far_clip);
+        blender::GPU_shader_uniform_1i(
+            shader, "orthographic", int(frame_generation.camera.orthographic));
+        blender::GPU_texture_image_bind(frame_generation.linear_depth_texture.gpu_texture, 0);
+        blender::GPU_texture_image_bind(frame_generation.motion_texture.gpu_texture, 1);
+        blender::GPU_texture_image_bind(frame_generation.hardware_depth_texture.gpu_texture, 2);
+        blender::GPU_texture_image_bind(frame_generation.screen_motion_texture.gpu_texture, 3);
+        blender::GPU_compute_dispatch(shader,
+                                      (frame_generation.guide_width + 15) / 16,
+                                      (frame_generation.guide_height + 15) / 16,
+                                      1);
+        blender::GPU_texture_image_unbind_all();
+        blender::GPU_shader_unbind();
+
+        // The viewport owns DLSSG and evaluates it after color management.
+        // Keep only the newest request when rendering advances faster than presentation.
+        frame_generation.pending_decision = decision;
+        frame_generation.pending_revision = revision;
+        frame_generation.pending_params = current_tile.params;
+        frame_generation.pending_valid = true;
+      }
+    }
   }
 
   /* Ensure blender::GPU fence exists to synchronize upload. */
@@ -620,6 +826,193 @@ void BlenderDisplayDriver::graphics_interop_update_buffer()
   }
 }
 
+bool BlenderDisplayDriver::dlss_denoiser_images_ensure(const int render_width,
+                                                      const int render_height,
+                                                      const int output_width,
+                                                      const int output_height,
+                                                      const int preset,
+                                                      DenoiserExternalImages &r_images)
+{
+  DlssDenoiserState &state = *dlss_denoiser_;
+  if (state.unavailable) {
+    return false;
+  }
+
+  if (state.session == nullptr) {
+    state.session = blender::gpu::dlss_ray_reconstruction_session_create();
+    if (state.session == nullptr) {
+      /* No Vulkan, so no model: the denoiser stays on its own path and this is never asked
+       * again. */
+      state.unavailable = true;
+      return false;
+    }
+  }
+
+  if (!state.session->ensure_images(
+          render_width, render_height, output_width, output_height, preset))
+  {
+    LOG_ERROR << "DLSS Ray Reconstruction: " << state.session->error_get();
+    state.unavailable = true;
+    state.session.reset();
+    return false;
+  }
+
+  /* Only when they are new: handing back the same handles a second time would have the renderer
+   * map memory it has already mapped, and close a handle it no longer owns. */
+  if (state.session->images_were_remade()) {
+    const blender::gpu::DlssRayReconstructionImages &images = state.session->images();
+    const struct {
+      const blender::gpu::DlssImageHandle *from;
+      DenoiserExternalImage *to;
+    } bindings[] = {
+        {&images.color, &r_images.color},
+        {&images.depth, &r_images.depth},
+        {&images.diffuse_albedo, &r_images.diffuse_albedo},
+        {&images.specular_albedo, &r_images.specular_albedo},
+        {&images.normal_roughness, &r_images.normal_roughness},
+        {&images.motion, &r_images.motion},
+        {&images.specular_motion, &r_images.specular_motion},
+        {&images.output, &r_images.output},
+    };
+    for (const auto &binding : bindings) {
+      binding.to->handle = binding.from->handle;
+      binding.to->memory_size = binding.from->memory_size;
+      binding.to->memory_offset = binding.from->memory_offset;
+      binding.to->width = binding.from->width;
+      binding.to->height = binding.from->height;
+      binding.to->channels = binding.from->channels;
+    }
+  }
+
+  return true;
+}
+
+bool BlenderDisplayDriver::dlss_denoiser_evaluate(const float jitter_x,
+                                                  const float jitter_y,
+                                                  const bool reset,
+                                                  const float *world_to_view,
+                                                  const float *view_to_clip)
+{
+  DlssDenoiserState &state = *dlss_denoiser_;
+  if (state.session == nullptr) {
+    return false;
+  }
+
+  blender::gpu::DlssRayReconstructionFrame frame;
+  frame.jitter_x = jitter_x;
+  frame.jitter_y = jitter_y;
+  frame.reset = reset;
+  if (world_to_view != nullptr && view_to_clip != nullptr) {
+    std::copy_n(world_to_view, 16, frame.world_to_view);
+    std::copy_n(view_to_clip, 16, frame.view_to_clip);
+    frame.have_camera_transforms = true;
+  }
+
+  if (!state.session->evaluate(frame)) {
+    LOG_ERROR << "DLSS Ray Reconstruction: " << state.session->error_get();
+    return false;
+  }
+
+  /* Nothing else to do here: Cycles reads the result out of the shared image and writes it into
+   * the render buffer, which is what both the screen and a saved frame are made from. */
+  return true;
+}
+
+bool BlenderDisplayDriver::frame_generation_interop_begin(const int width, const int height)
+{
+  FrameGenerationState &state = *frame_generation_;
+  state.guides_active = false;
+  state.guides_ready = false;
+
+  if (!state.enabled || state.permanently_failed ||
+      blender::GPU_backend_get_type() != blender::GPU_BACKEND_VULKAN)
+  {
+    return false;
+  }
+
+  bool depth_recreated = false;
+  bool motion_recreated = false;
+  if (!state.linear_depth_buffer.gpu_resources_ensure(
+          width, height, depth_recreated, sizeof(float)) ||
+      !state.motion_buffer.gpu_resources_ensure(
+          width, height, motion_recreated, sizeof(float) * 4) ||
+      !state.linear_depth_texture.gpu_resources_ensure(
+          width, height, blender::gpu::TextureFormat::SFLOAT_32) ||
+      !state.motion_texture.gpu_resources_ensure(
+          width, height, blender::gpu::TextureFormat::SFLOAT_32_32_32_32) ||
+      !state.hardware_depth_texture.gpu_resources_ensure(
+          width, height, blender::gpu::TextureFormat::SFLOAT_32) ||
+      !state.screen_motion_texture.gpu_resources_ensure(
+          width, height, blender::gpu::TextureFormat::SFLOAT_32_32))
+  {
+    return false;
+  }
+
+  if (depth_recreated) {
+    frame_generation_depth_buffer_.clear();
+  }
+  if (motion_recreated) {
+    frame_generation_motion_buffer_.clear();
+  }
+
+  if (state.guide_width != width || state.guide_height != height) {
+    state.guide_width = width;
+    state.guide_height = height;
+    state.pending_valid = false;
+    state.scheduler.request_reset();
+  }
+  state.guides_active = true;
+  return true;
+}
+
+void BlenderDisplayDriver::frame_generation_interop_update_buffer(
+    const FrameGenerationBuffer buffer)
+{
+  FrameGenerationState &state = *frame_generation_;
+  DisplayGPUPixelBuffer &pixel_buffer = (buffer == FrameGenerationBuffer::DEPTH) ?
+                                            state.linear_depth_buffer :
+                                            state.motion_buffer;
+  GraphicsInteropBuffer &interop_buffer = (buffer == FrameGenerationBuffer::DEPTH) ?
+                                              frame_generation_depth_buffer_ :
+                                              frame_generation_motion_buffer_;
+  if (!interop_buffer.is_empty()) {
+    return;
+  }
+
+  blender::GPUPixelBufferNativeHandle handle = blender::GPU_pixel_buffer_get_native_handle(
+      pixel_buffer.gpu_pixel_buffer);
+  interop_buffer.assign(GraphicsInteropDevice::VULKAN, handle.handle, handle.size);
+}
+
+void BlenderDisplayDriver::frame_generation_interop_end(const bool success)
+{
+  FrameGenerationState &state = *frame_generation_;
+  if (!state.guides_active || !success) {
+    state.guides_ready = false;
+    return;
+  }
+
+  blender::GPU_texture_update_sub_from_pixel_buffer(state.linear_depth_texture.gpu_texture,
+                                                    blender::GPU_DATA_FLOAT,
+                                                    state.linear_depth_buffer.gpu_pixel_buffer,
+                                                    0,
+                                                    0,
+                                                    0,
+                                                    state.guide_width,
+                                                    state.guide_height,
+                                                    0);
+  blender::GPU_texture_update_sub_from_pixel_buffer(state.motion_texture.gpu_texture,
+                                                    blender::GPU_DATA_FLOAT,
+                                                    state.motion_buffer.gpu_pixel_buffer,
+                                                    0,
+                                                    0,
+                                                    0,
+                                                    state.guide_width,
+                                                    state.guide_height,
+                                                    0);
+  state.guides_ready = true;
+}
+
 void BlenderDisplayDriver::graphics_interop_activate()
 {
   gpu_context_enable();
@@ -642,6 +1035,37 @@ void BlenderDisplayDriver::zero()
 void BlenderDisplayDriver::set_zoom(const float zoom_x, const float zoom_y)
 {
   zoom_ = make_float2(zoom_x, zoom_y);
+}
+
+void BlenderDisplayDriver::set_frame_generation_enabled(const bool enabled)
+{
+  FrameGenerationState &state = *frame_generation_;
+  if (state.enabled == enabled) {
+    return;
+  }
+  state.enabled = enabled;
+  state.pending_valid = false;
+  state.retained_frame_available = false;
+  b_engine_.viewport_frame_generation_hold_last_real = false;
+  state.scheduler.request_reset();
+  if (enabled) {
+    state.permanently_failed = false;
+  }
+}
+
+void BlenderDisplayDriver::set_frame_generation_camera(
+    const blender::gpu::FrameGenerationCamera &camera)
+{
+  frame_generation_->camera = camera;
+}
+
+void BlenderDisplayDriver::request_frame_generation_reset()
+{
+  FrameGenerationState &state = *frame_generation_;
+  state.pending_valid = false;
+  state.retained_frame_available = false;
+  b_engine_.viewport_frame_generation_hold_last_real = false;
+  state.scheduler.request_reset();
 }
 
 /* Update vertex buffer with new coordinates of vertex positions and texture coordinates.
@@ -759,12 +1183,14 @@ void BlenderDisplayDriver::draw(const Params &params)
 
   gpu_context_lock();
 
-  if (need_zero_) {
-    /* Texture is requested to be cleared and was not yet cleared.
-     *
-     * Do early return which should be equivalent of drawing all-zero texture.
-     * Watch out for the lock though so that the clear happening during update is properly
-     * synchronized here. */
+  FrameGenerationState &frame_generation = *frame_generation_;
+  const bool retain_previous_real_this_draw = (need_zero_ || params.texture_outdated) &&
+                                              frame_generation.enabled &&
+                                              !frame_generation.permanently_failed &&
+                                              frame_generation.retained_frame_available;
+  if (need_zero_ && !retain_previous_real_this_draw) {
+    /* Texture is requested to be cleared and was not yet cleared. Frame Generation keeps the
+     * preceding complete tile visible until the next real input arrives. */
     gpu_context_unlock();
     return;
   }
@@ -806,6 +1232,58 @@ void BlenderDisplayDriver::draw(const Params &params)
   blender::immUnbindProgram();
 
   display_shader_->unbind();
+
+  if (frame_generation.enabled && !frame_generation.permanently_failed &&
+      b_engine_.viewport != nullptr)
+  {
+    if (retain_previous_real_this_draw) {
+      blender::GPU_viewport_frame_generation_hold_last_real(b_engine_.viewport);
+    }
+    else {
+      blender::GPU_viewport_frame_generation_mark_active(b_engine_.viewport);
+    }
+    if (frame_generation.pending_valid) {
+      blender::GPUViewportFrameGenerationInput input;
+      input.depth = frame_generation.hardware_depth_texture.gpu_texture;
+      input.motion = frame_generation.screen_motion_texture.gpu_texture;
+      input.full_size = blender::int2(frame_generation.pending_params.full_size.x,
+                                      frame_generation.pending_params.full_size.y);
+      input.full_offset = blender::int2(frame_generation.pending_params.full_offset.x,
+                                        frame_generation.pending_params.full_offset.y);
+      input.region_size = blender::int2(frame_generation.pending_params.size.x,
+                                        frame_generation.pending_params.size.y);
+      input.render_size = blender::int2(frame_generation.guide_width,
+                                        frame_generation.guide_height);
+      input.revision = frame_generation.pending_revision;
+      input.frame_id = frame_generation.frame_id + 1;
+      input.reset = frame_generation.pending_decision.reset;
+      input.present_generated = frame_generation.pending_decision.present_generated;
+      input.camera = frame_generation.camera;
+
+      const blender::GPUViewportFrameGenerationSubmitResult result =
+          blender::GPU_viewport_frame_generation_submit(b_engine_.viewport, input);
+      if (result == blender::GPUViewportFrameGenerationSubmitResult::ACCEPTED) {
+        frame_generation.frame_id++;
+        frame_generation.scheduler.evaluation_succeeded(frame_generation.pending_revision,
+                                                        frame_generation.pending_decision);
+        frame_generation.last_evaluated_params = frame_generation.pending_params;
+        frame_generation.pending_valid = false;
+        frame_generation.retained_frame_available = true;
+        b_engine_.viewport_frame_generation_hold_last_real = true;
+        if (frame_generation.pending_decision.present_generated) {
+          b_engine_.flag |= blender::RE_ENGINE_DO_DRAW;
+        }
+      }
+      else if (result == blender::GPUViewportFrameGenerationSubmitResult::FAILED) {
+        frame_generation.permanently_failed = true;
+        frame_generation.pending_valid = false;
+        frame_generation.retained_frame_available = false;
+        b_engine_.viewport_frame_generation_hold_last_real = false;
+        frame_generation.scheduler.evaluation_failed();
+        LOG_WARNING << "DLSS Frame Generation disabled; continuing with real viewport frames";
+      }
+    }
+  }
 
   blender::GPU_blend(blender::GPU_BLEND_NONE);
 
@@ -880,14 +1358,18 @@ bool BlenderDisplayDriver::gpu_resources_create()
 
 void BlenderDisplayDriver::gpu_resources_destroy()
 {
+  b_engine_.viewport_frame_generation_hold_last_real = false;
   gpu_context_enable();
 
   display_shader_.reset();
 
   graphics_interop_buffer_.clear();
+  frame_generation_depth_buffer_.clear();
+  frame_generation_motion_buffer_.clear();
 
   tiles_->current_tile.gpu_resources_destroy();
   tiles_->finished_tiles.gl_resources_destroy_and_clear();
+  frame_generation_->gpu_resources_destroy();
 
   /* Fences. */
   if (gpu_render_sync_) {
