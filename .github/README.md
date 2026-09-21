@@ -1,5 +1,7 @@
 # Blender 5.2 Optimized Viewport
 
+**Development notes, and a way to support the work if the add-on is useful to you:** 🤔😄🤗 [patreon.com/YGLabs](https://www.patreon.com/c/YGLabs).🤗
+
 A fork of Blender 5.2.0 that denoises the Cycles viewport with NVIDIA DLSS Ray Reconstruction
 over NGX, generates intermediate frames with DLSS Frame Generation, and carries the viewport
 work those two turned out to need.
